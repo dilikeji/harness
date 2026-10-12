@@ -233,7 +233,23 @@
         # LAN literals derived from the active bind plus --trusted-host extras.
         # A deployment adding authorities keeps this expression and concatenates
         # its literals, for example: ['app.internal', ...ctx.webRuntime.trustedHosts].
-        trustedHosts: !!js ctx.webRuntime.trustedHosts
+        #
+        # DSH_TRUSTED_HOSTS (comma-separated authorities) is how a deployment
+        # behind a reverse proxy declares the name people actually type. The
+        # /api fence refuses every Host it was not told about, so a proxied
+        # deployment that sets nothing here answers 403 to everything.
+        #
+        # Kept on one line as a quoted scalar: `!!js` tags a scalar, so writing
+        # the array as a YAML flow sequence would make the parser read `[...]`
+        # as YAML first and fail on the `...` spreads inside it.
+        trustedHosts: !!js "[...ctx.webRuntime.trustedHosts, ...(process.env.DSH_TRUSTED_HOSTS ?? '').split(',').map(host => host.trim()).filter(host => host.length > 0)]"
+
+    # Multi-tenant HTTP endpoints: the login exchange the page calls before it
+    # has any identity, the identity read, and authorized workspace downloads.
+    # The first two are the carrier's only pre-authentication paths — see
+    # DEFAULT_PUBLIC_API_PATHS in @deepseek-ai/dsh-client-connection.
+    - id: tenant-controller
+      name: '@deepseek-ai/dsh-api-tenant-controller'
 
     # Raw Blob and ReadableStream uploads run independently of Connection's
     # RPC and generation service.

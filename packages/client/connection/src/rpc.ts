@@ -206,33 +206,64 @@ export interface HostConnectionHandle {
   createSharedFetchHandler(channel: '/api'): ConnectionFetchHandler
 
   /**
-   * Apply Connection's Host/Origin checks and browser authentication to
+   * Apply Connection's Host/Origin checks and tenant authentication to
    * another Web route.
    * @param request - request headers from the HTTP or upgrade request.
+   * @param upgradeUrl - upgrade request URL; supplying it admits the
+   *   query-parameter token form a WebSocket cannot replace with a header.
    * @returns rejection status, or undefined when the route may accept the request.
    */
-  requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
+  requestRejection(request: ConnectionTrustRequest, upgradeUrl?: string): ConnectionRequestRejection
 
   /**
-   * Admit one request: it passes {@link requestRejection} and speaks for the
-   * operator, or it is refused with that status.
+   * Admit one request: it passes {@link requestRejection} and speaks for its
+   * admitting Peer, or it is refused with that status.
    * @param request - request headers from the HTTP or upgrade request.
-   * @returns the operator Peer, or the rejection status.
+   * @param upgradeUrl - upgrade request URL, as for {@link requestRejection}.
+   * @returns the admitting Peer, or the rejection status.
    */
-  admit(request: ConnectionTrustRequest): PeerAdmission
+  admit(request: ConnectionTrustRequest, upgradeUrl?: string): PeerAdmission
 
   /**
-   * Authenticate one frontend index request, owning a token redirect or 401.
+   * Run one operation with the ambient context of the Peer it speaks for.
+   *
+   * A tenant Peer installs that tenant as the ambient owner of the nested
+   * chain, which is how a persistence plugin learns whose root to resolve
+   * without every layer between here and there carrying a tenant parameter.
+   * A Peer with no tenant behind it runs the operation unchanged.
+   * @param peer - the Peer the call speaks for.
+   * @param operation - operation to invoke.
+   * @returns the exact value returned by `operation`.
+   */
+  runWithPeer<T>(peer: PeerScope, operation: () => T): T
+
+  /**
+   * Whether one `/api` path is reachable before tenant authentication.
+   *
+   * The tenant login endpoints are necessarily public: they are how a browser
+   * obtains the identity every other endpoint requires.
+   * @param path - request path or URL, with or without a query string.
+   * @returns true when the path is a public API path.
+   */
+  isPublicApiPath(path: string | undefined): boolean
+
+  /**
+   * Decide whether one frontend index request may be served index.html.
+   *
+   * The static shell is public under tenant authentication: a browser has to
+   * load the page before it can read its entry token and present it, so there
+   * is no credential to check here.
    * @param request - root or configured-index HTTP request.
-   * @param response - response owned when the result is false.
-   * @returns true only when the frontend may serve index.html.
+   * @param response - response to own when the result is false.
+   * @returns true when the frontend may serve index.html.
    */
   authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean
 
   /**
-   * Add the fresh process token to an ordinary Web application URL.
+   * Present an ordinary Web application URL to a user.
    * @param baseUrl - clean application URL whose authority and mount are preserved.
-   * @returns tokenized URL for initial login; a mount proxy strips its prefix before {@link authorizeIndex}.
+   * @returns the URL to open; the entry token now comes from the deployment
+   *   rather than from this process, so the URL is returned unchanged.
    */
   authenticatedUrl(baseUrl: string): string
 }

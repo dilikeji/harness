@@ -7,6 +7,8 @@ import { WorkspaceCommands } from './commands.ts'
 import { DirectoryPickerController } from './directory-picker.ts'
 import { WorkspaceFeed, workspaceView } from './feed.ts'
 import { defaultWorkspaceDirectory, validateDocumentsDirectory } from './default-directory.ts'
+// Activates the `ctx.tenants` Context merge read by initializeDefault below.
+import type {} from '@deepseek-ai/dsh-tenant'
 import type {
   WorkspaceArchiveSessionRequest,
   WorkspaceArchiveValue,
@@ -98,6 +100,13 @@ export class WorkspaceController extends TypertRemoteService {
   @Remote('initializeDefault')
   async initializeDefault(signal: AbortSignal): Promise<WorkspaceValue | undefined> {
     const workspace = await this.ctx.workspaceRegistry.initializeDefault(async () => {
+      // A tenant's workspace is derived from its username and was already created
+      // by the login exchange, so the single-user first-use path — resolving the
+      // account's Documents directory — must not run under a tenant. It would
+      // either create a second, unreachable workspace or point at a shared
+      // directory every tenant could read.
+      const tenant = this.ctx.get('tenants')?.current()
+      if (tenant !== undefined) return tenant.workspace
       const timeout = AbortSignal.timeout(this.config.documentsLookupTimeoutMs)
       return await defaultWorkspaceDirectory(
         this.config.documentsDirectory, AbortSignal.any([signal, timeout]),

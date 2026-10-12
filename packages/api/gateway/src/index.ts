@@ -234,14 +234,28 @@ export class TypertGatewayService extends Service implements TypertGateway {
       connectionCtx.connection.rpc.intercept(
         '/api',
         endpoint => this.claimsEndpoint(endpoint),
-        (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer),
+        // The ambient tenant is installed from the Peer the call was admitted
+        // as, so the whole dispatch — and everything it wakes — resolves data
+        // roots for the right person.
+        (endpoint, payload, signal, peer) =>
+          connectionCtx.connection.runWithPeer(peer, () =>
+            this.dispatchRpc(endpoint, payload, signal, peer)),
       )
     })
     ctx.inject(['connection', 'webServer'], (webCtx) => {
       const listen = (): void => {
         const mux = new RemoteStreamMuxServer(
+          // A stream is lazy: the generator body runs when the consumer pulls,
+          // on a stack unrelated to the call that opened it. Wrapping only the
+          // *creation* of the iterable therefore leaves every item outside the
+          // tenant — which is how the workspace baseline came to be read with
+          // no tenant and answered from the single-user registry.
           (endpoint, payload, uplink, peer, control) =>
-            this.openWireStream(endpoint, payload, uplink, peer, control.signal, control),
+            Promise.resolve(inPeerAmbient(
+              webCtx.connection,
+              peer,
+              () => this.openWireStream(endpoint, payload, uplink, peer, control.signal, control),
+            )),
           this.wireStream.failure,
           resolved.websocketHeartbeatIntervalMs,
           resolved.streamInboxBytes,
@@ -251,7 +265,10 @@ export class TypertGatewayService extends Service implements TypertGateway {
           const route: WebUpgradeRoute = {
             path: REMOTE_STREAM_MUX_PATH,
             handler: (req, socket, head) => {
-              const admission = webCtx.connection.admit(req)
+              // A WebSocket cannot set request headers, so the upgrade presents
+              // its tenant token in the query; passing `req.url` is what admits
+              // that form.
+              const admission = webCtx.connection.admit(req, req.url)
               if ('rejection' in admission) {
                 rejectRemoteStreamUpgrade(socket, admission.rejection)
                 return
@@ -1570,6 +1587,43 @@ function isPlainObject(value: object): value is Record<string, unknown> {
 
 function isObject(value: unknown): value is object {
   return (typeof value === 'object' && value !== null) || typeof value === 'function'
+}
+
+/**
+ * Re-enter one Peer's ambient context around every part of a stream.
+ *
+ * A stream is lazy. `create()` returns an iterable whose body has not run yet;
+ * the generator resumes whenever the consumer pulls, on a stack that has
+ * nothing to do with the call that opened it. The context therefore has to be
+ * installed around each `next()`, not around the iterable's construction —
+ * otherwise every item is produced with no tenant ambient, and anything reading
+ * tenant-scoped state answers from the untenanted layout. That is exactly how
+ * the Workspace baseline came to list the single-user registry's workspaces.
+ *
+ * The Peer is what survives the gap: it was resolved at admission and is held
+ * for the connection's lifetime, so it can restore the context the upgrade
+ * brought with it.
+ * @param connection - Host Connection, which owns the ambient installation.
+ * @param peer - the Peer the upgrade was admitted as.
+ * @param create - builds the underlying stream inside the ambient context.
+ * @returns a stream whose every item is produced with that Peer ambient.
+ */
+async function* inPeerAmbient<T>(
+  connection: { runWithPeer<U>(peer: PeerScope, operation: () => U): U },
+  peer: PeerScope,
+  create: () => Promise<AsyncIterable<T>> | AsyncIterable<T>,
+): AsyncGenerator<T> {
+  const source = await connection.runWithPeer(peer, async () => await create())
+  const iterator = source[Symbol.asyncIterator]()
+  try {
+    while (true) {
+      const step = await connection.runWithPeer(peer, async () => await iterator.next())
+      if (step.done === true) return
+      yield step.value
+    }
+  } finally {
+    await connection.runWithPeer(peer, async () => await iterator.return?.())
+  }
 }
 
 export default TypertGatewayService

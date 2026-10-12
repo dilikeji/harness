@@ -46,3 +46,14 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
+.workbuddy/
+*.log
+
+# `tsc -b` emits beside sources when a project's rootDir does not cover every
+# file it pulls in (a package that imports another package's source without a
+# project reference). Those outputs are build residue, never sources: `src/`
+# holds TypeScript only, and every emitted artifact belongs under `lib/`.
+packages/*/*/src/**/*.js
+packages/*/*/src/**/*.d.ts
+packages/*/*/src/**/*.js.map
+packages/*/*/src/**/*.d.ts.map

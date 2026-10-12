@@ -21,8 +21,10 @@
     { "path": "../../host/directory-picker" },
     { "path": "../../storage/storage-domain" },
     { "path": "../../typert/protocol" },
+    { "path": "../../tenant/tenant" },
     { "path": "../../util/deque" },
     { "path": "../../util/native-command" },
+    { "path": "../../tenant/tenant" },
     { "path": "../../workspace/workspace" }
   ]
 }

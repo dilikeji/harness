@@ -43,6 +43,19 @@ import { WorkspacePickFlow } from '../WorkspacePicker.tsx'
 import css from './WorkspaceBrowser.module.css'
 
 /**
+ * Whether the header offers an "add workspace" action.
+ *
+ * Off in this deployment. A tenant owns exactly one workspace, derived from its
+ * username and created by the login exchange, so there is never a second one to
+ * add — and that flow's only route is picking a host directory, which is not a
+ * choice a tenant should be making.
+ *
+ * A named constant rather than a deleted block, so restoring the button is a
+ * one-word change and the surrounding header keeps its shape.
+ */
+const SHOW_ADD_WORKSPACE = false
+
+/**
  * Column slide length (--ds-transition-duration-slow): rail-search focus waits it out —
  * focus() forces a synchronous layout and would jank the slide.
  */
@@ -282,7 +295,7 @@ function SessionTree({
   list, useSessionStatus, startSession, open, workspaces, ungroupedSessionIds,
   rowState, onLeaveArchivedOnly,
   workspaceReady, animationResetKey, usePanelInfo,
-  onRenameRequest, onDeleteRequest, onSessionRenameRequest,
+  onSessionRenameRequest,
   renderSlot,
   insertWorkspaceBefore,
   nestWorkspaces, groupExpansion, setGroupExpanded,
@@ -512,18 +525,18 @@ function SessionTree({
             }
           }}
           drag={workspaceDragProps}
-          actions={group.workspaceId === undefined
-            ? undefined
-            : {
-              rename: () => {
-              /* v8 ignore next -- narrowing guard: the actions object exists only for real-workspace groups. */
-                if (group.workspaceId !== undefined) onRenameRequest(group.workspaceId, group.label)
-              },
-              delete: () => {
-              /* v8 ignore next -- narrowing guard: the actions object exists only for real-workspace groups. */
-                if (group.workspaceId !== undefined) onDeleteRequest(group.workspaceId, group.label)
-              },
-            }}
+          /*
+           * No per-Workspace actions in this deployment, so the row renders no
+           * overflow menu at all.
+           *
+           * Renaming and deleting are both Host-level registry operations, and
+           * a tenant's one workspace is derived from its username and created by
+           * the login exchange — the name is the folder name, and deleting the
+           * registration is what produced the cross-tenant ghost earlier.
+           * `onRenameRequest` stays wired for the title double-click path; only
+           * the menu entry goes away.
+           */
+          actions={undefined}
         />
         {childRows.length > 0 && (
           <div role="group">
@@ -1284,7 +1297,10 @@ export function WorkspaceBrowser({
           {/* Adding is the button's one action, so a composition with no
               picking affordance has nothing to offer here: the region hides the
               button rather than leaving a dead one in the header. */}
-          {directoryFlowAvailable && (
+          {/* Not mounted in this deployment either: a tenant owns exactly one
+              workspace, created by its login exchange, so there is never a
+              second one to add. Restore by making this constant true. */}
+          {SHOW_ADD_WORKSPACE && directoryFlowAvailable && (
             <Tooltip label={t('workspace.add')} shortcutKeys={addShortcut?.keys} side="bottom" delayMs={500}>
               <button
                 ref={wsPlusRef}

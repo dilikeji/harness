@@ -251,7 +251,11 @@ class JsonlSessionPersistence extends SessionPersistence {
   /** Backend label for diagnostics and effects; shadows `Service.name` without changing the service key. */
   override readonly name = 'session-persistence-jsonl'
 
-  private root: string
+  /**
+   * Configured fallback root, resolved once so later `process.cwd()` changes
+   * cannot split one backend across roots.
+   */
+  private readonly fallbackRoot: string
   private compression: JsonlCompression
   private rootEncodingCheck: Promise<void> | undefined
   private readonly tracker = new JsonlBackendTracker(this.name)
@@ -277,7 +281,7 @@ class JsonlSessionPersistence extends SessionPersistence {
       )
     }
     // Resolve once so later process.cwd() changes cannot split one backend across roots.
-    this.root = resolve(config.root)
+    this.fallbackRoot = resolve(config.root)
     this.compression = config.compression ?? DEFAULT_COMPRESSION
     this.generationFormat = {
       currentVersion: sessionFormatCatalog.currentVersion,
@@ -289,6 +293,20 @@ class JsonlSessionPersistence extends SessionPersistence {
     }
     this.assertUsableRoot()
     this.tracker.install(ctx)
+  }
+
+  /**
+   * The root this call's tenant owns.
+   *
+   * Read per access rather than fixed at construction: `ctx.tenantPaths` is an
+   * ambient lookup, so one backend serves every tenant by resolving a different
+   * directory, and nothing above it — Session, the API layer, the UI — has to
+   * learn that tenants exist. A call outside any tenant chain (process startup,
+   * a shared timer) resolves `undefined` and falls back to the configured root,
+   * which keeps the single-user layout intact.
+   */
+  private get root(): string {
+    return this.ctx.get('tenantPaths')?.root('sessions', this.fallbackRoot) ?? this.fallbackRoot
   }
 
   /**

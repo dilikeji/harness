@@ -11,6 +11,8 @@ import type {
 } from '@deepseek-ai/dsh-attachment'
 import type { FileUploadReceiptId } from '@deepseek-ai/dsh-client-file-upload/types'
 import type {} from '@deepseek-ai/dsh-client-file-upload'
+// Activates the `ctx.tenants` Context merge read by resolveCwd below.
+import type {} from '@deepseek-ai/dsh-tenant'
 import {
   ReasoningEffortId, assistantStreamChunks, createUserMessage, freezeMessage,
 } from '@deepseek-ai/dsh-llm'
@@ -98,25 +100,67 @@ export class SessionCommandController {
   ) {}
 
   /**
+   * The working directory a new Session starts in.
+   *
+   * Under a tenant this is not a choice. A tenant owns exactly one workspace,
+   * derived from its username, and honoring a request that named a different
+   * directory would let one person's session read another's files — the
+   * isolation would be decorative. The registry's own attachment check would
+   * reject the mismatch later anyway; deciding here means the refusal names the
+   * right cause instead of surfacing as a confusing attach failure.
+   *
+   * Outside a tenant chain the request's own input, then the configured
+   * default, still decide, so single-user behavior is unchanged.
+   */
+  private resolveCwd(workspace: Workspace | undefined, request: SessionCreateRequest): string {
+    const tenant = this.ctx.get('tenants')?.current()
+    if (tenant !== undefined) return tenant.workspace
+    return workspace?.path ?? request.cwd ?? this.defaultCwd
+  }
+
+  /**
+   * The Workspace a new Session belongs to.
+   *
+   * Under a tenant this is not a choice, and a client-supplied id is **ignored
+   * rather than refused**. The page remembers the workspace it last used, so a
+   * browser still holding an id from an earlier layout — or from the
+   * single-user registry that preceded the tenant layer — would otherwise make
+   * every new session fail with `workspace/not-found`. The tenant's one
+   * workspace is the answer, and it is also the one the session must attach to
+   * for the sidebar to list it.
+   *
+   * Outside a tenant chain the request decides, and an unknown id is still the
+   * error it always was.
+   */
+  private async resolveWorkspace(request: SessionCreateRequest): Promise<Workspace | undefined> {
+    const tenant = this.ctx.get('tenants')?.current()
+    if (tenant !== undefined) return await this.ctx.workspaceRegistry.resolveByPath(tenant.workspace)
+    if (request.workspaceId === undefined) return undefined
+    const workspace = this.ctx.workspaceRegistry.get(request.workspaceId)
+    if (workspace === undefined) {
+      throw new RemoteError('workspace/not-found', `workspace "${request.workspaceId}" not found`, {
+        workspaceId: request.workspaceId,
+      })
+    }
+    return workspace
+  }
+
+  /**
    * Create or idempotently adopt one ordinary Session.
    * @param request - requested identity, location, and Agent preset.
    * @returns the Session identity and resolved preset when configured.
    */
   async create(request: SessionCreateRequest): Promise<SessionCreateValue> {
-    if (request.workspaceId !== undefined && request.cwd !== undefined) {
+    // The exclusivity rule belongs to the single-user path, where both fields
+    // are real inputs. Under a tenant neither is: the workspace is derived, so
+    // a page sending both is not a caller error worth failing on.
+    if (this.ctx.get('tenants')?.current() === undefined
+      && request.workspaceId !== undefined && request.cwd !== undefined) {
       throw new RemoteError('gateway/bad-request', 'session.create accepts workspaceId or cwd, not both', {})
     }
     const sessionId = request.sessionId ?? brandString<SessionId>(`session-${randomUUID()}`)
-    let workspace: Workspace | undefined
-    if (request.workspaceId !== undefined) {
-      workspace = this.ctx.workspaceRegistry.get(request.workspaceId)
-      if (workspace === undefined) {
-        throw new RemoteError('workspace/not-found', `workspace "${request.workspaceId}" not found`, {
-          workspaceId: request.workspaceId,
-        })
-      }
-    }
-    const cwd = workspace?.path ?? request.cwd ?? this.defaultCwd
+    const workspace = await this.resolveWorkspace(request)
+    const cwd = this.resolveCwd(workspace, request)
     let adopted: Agent
     try {
       adopted = await this.agents.ensureSession(

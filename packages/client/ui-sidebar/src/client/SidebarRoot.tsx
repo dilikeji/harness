@@ -306,9 +306,12 @@ export function SidebarRoot({
         <div className={css.footerActions}>
           {renderSlot('sidebar.footer.action', { wide })}
         </div>
-        <div className={css.settingsArea}>
-          {renderSlot('sidebar.settings', { wide })}
-        </div>
+        {/* This deployment mounts no Settings launcher. The surface that slot
+            opened exposed Host- and profile-level configuration a tenant has no
+            business changing — the model endpoint, the key, the workspace — and
+            the deployment owns all three. The slot stays declared, so a
+            deployment that wants the launcher back restores this one call. */}
+        <div className={css.settingsArea} />
       </div>
     </div>
   )

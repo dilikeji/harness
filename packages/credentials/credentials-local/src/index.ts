@@ -43,6 +43,8 @@ import { dirname, join, resolve } from 'node:path'
 import { Document, isMap, isScalar, parseDocument, type YAMLError } from 'yaml'
 import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { canonicalizeWatchPath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+// Activates the `ctx.tenantPaths` Context merge read for per-tenant documents.
+import type {} from '@deepseek-ai/dsh-tenant'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { CredentialProvider, credentialRef, parseCredentialKey } from '@deepseek-ai/dsh-credentials'
 import type {
@@ -77,6 +79,34 @@ interface ResolvedSpec {
   filename: string
   watch: boolean
   debounceMs: number
+}
+
+/**
+ * One credentials document's in-memory state.
+ *
+ * Split out of the provider because a process may address many documents — one
+ * per tenant — and each needs its own text cache, parsed snapshots, and write
+ * chain. The write chain in particular must not be shared: it exists so a
+ * reload and a line edit of *the same file* serialize, and two tenants' writes
+ * have no reason to wait for each other.
+ */
+interface DocumentState {
+  /**
+   * Raw text of the last read or persisted document; `undefined` while the
+   * file is absent. Watcher events whose content equals this cache are no-ops,
+   * which is also the self-write suppression.
+   */
+  text: string | undefined
+  /** Parsed reference snapshot; replaced wholesale on every reload. */
+  values: Map<string, string>
+  /** Parsed record snapshot; replaced wholesale on every reload. */
+  records: Map<string, CredentialRecord>
+  /**
+   * Single exclusive operation chain: watcher reloads and line edits run one
+   * at a time in queue order (settled tail), so an edit can never render from
+   * text a concurrent reload is busy replacing.
+   */
+  operations: Promise<void>
 }
 
 /**
@@ -519,24 +549,53 @@ export class LocalCredentialProvider extends CredentialProvider {
   })
 
   private readonly spec: ResolvedSpec
+
   /**
-   * Raw text of the last read or persisted document; `undefined` while the
-   * file is absent. Watcher events whose content equals this cache are no-ops,
-   * which is also the self-write suppression.
+   * The credentials document this call reads or writes.
+   *
+   * Resolved per access, never captured once. `ctx.tenantPaths` is an ambient
+   * lookup, so a single provider serves every tenant by addressing a different
+   * file, and nothing above it — the LLM adapters, the Models page — has to
+   * learn that tenants exist. Outside a tenant chain the configured path
+   * stands, leaving the single-user layout unchanged.
    */
-  private text: string | undefined
-  /** Parsed reference snapshot; replaced wholesale on every reload. */
-  private values = new Map<string, string>()
-  /** Parsed record snapshot; replaced wholesale on every reload. */
-  private records = new Map<string, CredentialRecord>()
+  private get filename(): string {
+    return this.ctx.get('tenantPaths')?.file(CREDENTIALS_FILENAME, this.spec.filename)
+      ?? this.spec.filename
+  }
+
   /**
-   * Single exclusive operation chain: watcher reloads and line edits run one
-   * at a time in queue order (settled tail), so an edit can never render from
-   * text a concurrent reload is busy replacing.
+   * In-memory state of each addressed document, keyed by its resolved path.
+   *
+   * Per document, and therefore per tenant. Under multi-tenancy every tenant
+   * owns a separate credentials file, and this state holds that file's
+   * *parsed contents* — one shared snapshot would let a tenant's `resolve`
+   * answer with another tenant's key, the single leak this layer exists to
+   * prevent.
    */
-  private operations: Promise<void> = Promise.resolve()
+  private readonly documents = new Map<string, DocumentState>()
   /** Set at dispose: refuse new writes and let in-flight work no-op. */
   private closed = false
+
+  /**
+   * The state of the document this call addresses, created on first touch.
+   *
+   * Kept for the process lifetime, exactly as the single document used to be:
+   * a tenant's parsed snapshot is as worth caching as anyone's.
+   */
+  private get doc(): DocumentState {
+    const key = this.filename
+    const existing = this.documents.get(key)
+    if (existing !== undefined) return existing
+    const created: DocumentState = {
+      text: undefined,
+      values: new Map(),
+      records: new Map(),
+      operations: Promise.resolve(),
+    }
+    this.documents.set(key, created)
+    return created
+  }
 
   /** Opaque read of {@link closed}: control flow cannot narrow it across awaits. */
   private isClosed(): boolean {
@@ -557,6 +616,22 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
 
   /**
+   * The environment value that outranks this document — empty under a tenant.
+   *
+   * `DEEPSEEK_API_KEY=…` in the launching shell is one value shared by every
+   * tenant, so letting it win would hand everybody the same key and would also
+   * make `set` refuse every write ("shadowed by a read-only source") while
+   * resolution kept answering with the environment's. Under a tenant the
+   * managed document is therefore the sole authority. Outside a tenant chain
+   * the inherited layer still wins unchanged, so `DEEPSEEK_API_KEY=… dsh` and
+   * CI runs behave exactly as before.
+   */
+  private shadowingInherited(ref: CredentialRef): string | undefined {
+    if (this.ctx.get('tenantPaths')?.current() !== undefined) return undefined
+    return this.inherited(ref)
+  }
+
+  /**
    * The `.env` fallback for a reference — below the managed store, never above
    * it. The invoking project ranks over the user's home file, matching the
    * environment layering: the more specific location wins.
@@ -571,11 +646,11 @@ export class LocalCredentialProvider extends CredentialProvider {
       // Drain: refuse new operations, then settle the queued ones so disposal
       // completes only once storage is quiescent.
       this.closed = true
-      await this.operations
+      await this.doc.operations
     }
     await this.loadInitial()
     if (!this.spec.watch) return
-    const watcher = chokidarWatch(await canonicalizeWatchPath(this.spec.filename), {
+    const watcher = chokidarWatch(await canonicalizeWatchPath(this.filename), {
       ignoreInitial: true,
       awaitWriteFinish: {
         stabilityThreshold: this.spec.debounceMs,
@@ -594,7 +669,7 @@ export class LocalCredentialProvider extends CredentialProvider {
       this.queueRefresh()
     })
     watcher.on('error', (error) => {
-      this.ctx.logger.warn('credentials-local: watcher error on %s', this.spec.filename)
+      this.ctx.logger.warn('credentials-local: watcher error on %s', this.filename)
       this.ctx.logger.warn(error)
     })
     yield async () => {
@@ -602,14 +677,14 @@ export class LocalCredentialProvider extends CredentialProvider {
       // queued or in-flight operation so nothing publishes after disposal.
       this.closed = true
       await watcher.close()
-      await this.operations
+      await this.doc.operations
     }
   }
 
   override resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined> {
-    const inherited = this.inherited(ref)
+    const inherited = this.shadowingInherited(ref)
     if (inherited !== undefined) return Promise.resolve({ value: inherited, source: 'env' })
-    const stored = this.values.get(ref)
+    const stored = this.doc.values.get(ref)
     if (stored !== undefined) return Promise.resolve({ value: stored, source: 'file' })
     const fallback = this.dotenvFallback(ref)
     if (fallback !== undefined) return Promise.resolve({ value: fallback.value, source: fallback.source })
@@ -620,10 +695,10 @@ export class LocalCredentialProvider extends CredentialProvider {
     // Only the inherited environment is unwritable: it is the one layer this
     // process cannot edit. A user `.env` value is writable in the sense that
     // matters — storing a key replaces it as the effective one.
-    if (this.inherited(ref) !== undefined) {
+    if (this.shadowingInherited(ref) !== undefined) {
       return Promise.resolve({ configured: true, source: 'env', writable: false })
     }
-    const stored = this.values.get(ref)
+    const stored = this.doc.values.get(ref)
     if (stored !== undefined) return Promise.resolve({ configured: true, source: 'file', writable: true })
     const fallback = this.dotenvFallback(ref)
     if (fallback !== undefined) return Promise.resolve({ configured: true, source: fallback.source, writable: true })
@@ -642,11 +717,11 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
 
   override readRecord(key: CredentialKey): Promise<CredentialRecord | undefined> {
-    return Promise.resolve(this.records.get(key))
+    return Promise.resolve(this.doc.records.get(key))
   }
 
   override describeRecord(key: CredentialKey): Promise<CredentialRecordInfo> {
-    const stored = this.records.get(key)
+    const stored = this.doc.records.get(key)
     // Presence is the whole fact here: no layer ranks above this document for
     // a record, so nothing can shadow one, and an api-key record carrying
     // neither a key nor environment values is a deliberate statement rather
@@ -656,7 +731,7 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
 
   override listRecords(): Promise<readonly CredentialRecordEntry[]> {
-    return Promise.resolve([...this.records].map(([key, record]) => ({
+    return Promise.resolve([...this.doc.records].map(([key, record]) => ({
       // The parser has already proven every stored key addressable.
       key: parseCredentialKey(key),
       kind: record.kind,
@@ -672,13 +747,13 @@ export class LocalCredentialProvider extends CredentialProvider {
       if (this.isClosed()) {
         throw new Error(`credentials-local was disposed before the queued "${key}" modify ran`)
       }
-      await mkdir(dirname(this.spec.filename), { recursive: true, mode: 0o700 })
-      return withFileLock(this.spec.filename, async () => {
+      await mkdir(dirname(this.filename), { recursive: true, mode: 0o700 })
+      return withFileLock(this.filename, async () => {
         // Read-modify-write: `mutate` must decide against the record as it
         // stands now, not as this process last saw it — another process may
         // have rotated it since.
         await this.reconcileFromDisk()
-        const current = this.records.get(key)
+        const current = this.doc.records.get(key)
         const next = await mutate(current)
         if (next === undefined) return current
         // Admitted before it is rendered: what the read path would refuse is
@@ -686,11 +761,11 @@ export class LocalCredentialProvider extends CredentialProvider {
         // next boot rejects, and a value refused here has not been stored.
         if (next.kind === 'grant') assertJsonValue(`record "${key}" payload`, next.payload, new Set())
         else assertStorableApiKey(key, next)
-        const nextText = renderRecord(this.text, key, next)
+        const nextText = renderRecord(this.doc.text, key, next)
         // 0600: a document holding secrets is never world-readable.
-        await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
-        this.text = nextText
-        this.records.set(key, next)
+        await writeFileAtomic(this.filename, nextText, { mode: 0o600, dirMode: 0o700 })
+        this.doc.text = nextText
+        this.doc.records.set(key, next)
         // After the commit, on the same terms as a reference write.
         this.notifyRecordUpdated(key)
         return next
@@ -704,14 +779,14 @@ export class LocalCredentialProvider extends CredentialProvider {
       if (this.isClosed()) {
         throw new Error(`credentials-local was disposed before the queued "${key}" delete ran`)
       }
-      await mkdir(dirname(this.spec.filename), { recursive: true, mode: 0o700 })
-      await withFileLock(this.spec.filename, async () => {
+      await mkdir(dirname(this.filename), { recursive: true, mode: 0o700 })
+      await withFileLock(this.filename, async () => {
         await this.reconcileFromDisk()
-        if (!this.records.has(key)) return
-        const nextText = renderRecord(this.text, key, undefined)
-        await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
-        this.text = nextText
-        this.records.delete(key)
+        if (!this.doc.records.has(key)) return
+        const nextText = renderRecord(this.doc.text, key, undefined)
+        await writeFileAtomic(this.filename, nextText, { mode: 0o600, dirMode: 0o700 })
+        this.doc.text = nextText
+        this.doc.records.delete(key)
         this.notifyRecordUpdated(key)
       }, { waitMs: DOCUMENT_LOCK_WAIT_MS })
     })
@@ -719,8 +794,8 @@ export class LocalCredentialProvider extends CredentialProvider {
 
   /** Queue one exclusive document operation behind every earlier one. */
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const task = this.operations.then(operation)
-    this.operations = task.then(() => undefined, () => undefined)
+    const task = this.doc.operations.then(operation)
+    this.doc.operations = task.then(() => undefined, () => undefined)
     return task
   }
 
@@ -744,21 +819,21 @@ export class LocalCredentialProvider extends CredentialProvider {
       this.assertUnshadowed(ref, verb)
       // The writer lock's exclusive create needs the parent to exist; 0700
       // because the harness home holds user-private data.
-      await mkdir(dirname(this.spec.filename), { recursive: true, mode: 0o700 })
-      await withFileLock(this.spec.filename, async () => {
+      await mkdir(dirname(this.filename), { recursive: true, mode: 0o700 })
+      await withFileLock(this.filename, async () => {
         // Read-modify-write: fold in any on-disk state this process has not
         // observed yet — an external edit still inside the watcher debounce
         // window, a change the watcher missed, or another process's write —
         // so the line edit below can never resurrect a stale document.
         await this.reconcileFromDisk()
-        const existing = this.values.get(ref)
+        const existing = this.doc.values.get(ref)
         if (value === undefined && existing === undefined) return
-        const nextText = renderRef(this.text, ref, value)
+        const nextText = renderRef(this.doc.text, ref, value)
         // 0600: a document holding secrets is never world-readable.
-        await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
-        this.text = nextText
-        if (value === undefined) this.values.delete(ref)
-        else this.values.set(ref, value)
+        await writeFileAtomic(this.filename, nextText, { mode: 0o600, dirMode: 0o700 })
+        this.doc.text = nextText
+        if (value === undefined) this.doc.values.delete(ref)
+        else this.doc.values.set(ref, value)
         // After the commit: a broken observer must never make the durable
         // write look failed.
         this.notifyUpdated(ref)
@@ -772,7 +847,7 @@ export class LocalCredentialProvider extends CredentialProvider {
    * provider resolves ranks below the document being written.
    */
   private assertUnshadowed(ref: CredentialRef, verb: 'set' | 'unset'): void {
-    if (this.inherited(ref) !== undefined) {
+    if (this.shadowingInherited(ref) !== undefined) {
       throw new Error(
         `credentials-local: "${ref}" is supplied read-only by the launching environment, so ${verb} would be`
         + ' shadowed; unset it in the shell you start dsh from instead',
@@ -789,19 +864,19 @@ export class LocalCredentialProvider extends CredentialProvider {
    * the layout change without a hand edit.
    */
   private async loadInitial(): Promise<void> {
-    await assertOwnerOnly(this.spec.filename)
+    await assertOwnerOnly(this.filename)
     let text: string
     try {
-      text = await readFile(this.spec.filename, 'utf8')
+      text = await readFile(this.filename, 'utf8')
     } catch (error) {
       if (!isENOENT(error)) throw error
       return
     }
     if (renderFlatLayoutMigration(text) !== undefined) text = await this.migrateFlatDocument()
-    const document = parseCredentialsDocument(text, this.spec.filename)
-    this.values = document.refs
-    this.records = document.records
-    this.text = text
+    const document = parseCredentialsDocument(text, this.filename)
+    this.doc.values = document.refs
+    this.doc.records = document.records
+    this.doc.text = text
   }
 
   /**
@@ -815,8 +890,8 @@ export class LocalCredentialProvider extends CredentialProvider {
    * @returns the document text this boot should parse.
    */
   private async migrateFlatDocument(): Promise<string> {
-    return withFileLock(this.spec.filename, async () => {
-      const current = await readFile(this.spec.filename, 'utf8')
+    return withFileLock(this.filename, async () => {
+      const current = await readFile(this.filename, 'utf8')
       const migrated = renderFlatLayoutMigration(current)
       /* v8 ignore next 2 -- the losing side of the cross-process migration race:
          another boot rewrote the document between the unlocked recognize and
@@ -825,10 +900,10 @@ export class LocalCredentialProvider extends CredentialProvider {
          decision itself is the recognizer's covered versioned-document decline. */
       if (migrated === undefined) return current
       // 0600: a document holding secrets is never world-readable.
-      await writeFileAtomic(this.spec.filename, migrated, { mode: 0o600, dirMode: 0o700 })
+      await writeFileAtomic(this.filename, migrated, { mode: 0o600, dirMode: 0o700 })
       this.ctx.logger.info(
         'credentials-local: migrated %s to the version %d layout; values are unchanged',
-        this.spec.filename,
+        this.filename,
         DOCUMENT_VERSION,
       )
       return migrated
@@ -846,7 +921,7 @@ export class LocalCredentialProvider extends CredentialProvider {
     try {
       await this.reconcileFromDisk()
     } catch (error) {
-      this.ctx.logger.warn('credentials-local: reload failed at %s; keeping the last good document', this.spec.filename)
+      this.ctx.logger.warn('credentials-local: reload failed at %s; keeping the last good document', this.filename)
       this.ctx.logger.warn(error)
     }
   }
@@ -861,23 +936,23 @@ export class LocalCredentialProvider extends CredentialProvider {
   private async reconcileFromDisk(): Promise<void> {
     // Re-checked on every reload and before every write: an external editor or
     // a restored backup can loosen the mode after boot.
-    await assertOwnerOnly(this.spec.filename)
+    await assertOwnerOnly(this.filename)
     let text: string | undefined
     try {
-      text = await readFile(this.spec.filename, 'utf8')
+      text = await readFile(this.filename, 'utf8')
     } catch (error) {
       if (!isENOENT(error)) throw error
       text = undefined
     }
-    if (text === this.text || this.isClosed()) return
+    if (text === this.doc.text || this.isClosed()) return
     const next = text === undefined
       ? { refs: new Map<string, string>(), records: new Map<string, CredentialRecord>() }
-      : parseCredentialsDocument(text, this.spec.filename)
-    const changedRefs = this.changedRefs(this.values, next.refs)
-    const changedRecords = this.changedRecords(this.records, next.records)
-    this.text = text
-    this.values = next.refs
-    this.records = next.records
+      : parseCredentialsDocument(text, this.filename)
+    const changedRefs = this.changedRefs(this.doc.values, next.refs)
+    const changedRecords = this.changedRecords(this.doc.records, next.records)
+    this.doc.text = text
+    this.doc.values = next.refs
+    this.doc.records = next.records
     for (const ref of changedRefs) this.notifyUpdated(ref)
     for (const key of changedRecords) this.notifyRecordUpdated(key)
   }

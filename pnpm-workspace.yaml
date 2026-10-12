@@ -18,6 +18,16 @@ overrides:
   'extract-zip>yauzl': '3.4.0'
   '@deepseek-ai/cosmokit': 'link:vendor/cosmokit'
   '@deepseek-ai/schemastery': 'link:vendor/schemastery'
+  # A fresh install resolved micromark-core-commonmark 2.0.4, which pulls its own
+  # micromark-util-types 2.0.3 alongside the 2.0.2 the rest of the markdown
+  # pipeline uses. The two versions' `Extension` types are structurally
+  # incompatible (one gains `this`-typed members the other lacks), so
+  # ui-primitives' fromMarkdown call stops type-checking against either
+  # overload. Pinning the closure's root keeps one version; the other two are
+  # named explicitly so a later partial upgrade cannot reintroduce the split.
+  'micromark-core-commonmark': '2.0.3'
+  'micromark-factory-space': '2.0.1'
+  'micromark-util-types': '2.0.2'
 
 peerDependencyRules:
   allowedVersions:

@@ -51,6 +51,19 @@ export type {
 } from '../rpc.ts'
 export type { RpcFetch } from './rpc.ts'
 
+// The tenant token is part of the client wire contract, not an implementation
+// detail: the Gateway's stream client needs it to build its upgrade URL, and the
+// page's login gate is what writes it.
+export {
+  TENANT_TOKEN_HEADER,
+  TENANT_TOKEN_QUERY,
+  TENANT_TOKEN_STORAGE_KEY,
+  clearTenantToken,
+  readTenantToken,
+  tenantAuthHeaders,
+  writeTenantToken,
+} from './tenant-token.ts'
+
 /** Observable identity and Host facts for the active connection generation. */
 export interface ConnectionGenerationState {
   /** Active generation, or undefined before readiness and while reconnecting. */

@@ -364,7 +364,13 @@ class UiWorkspaceService extends Service implements UiWorkspace {
       sessionId = await this.reuseBlank(workspace.workspaceId, summary.id)
     }
     let target = workspace?.workspaceId ?? recentWorkspace(workspaces.items, sessions.byId)
-    if (target === undefined && workspaces.items.length === 0 && sessions.ids.length === 0) {
+    if (target === undefined) {
+      // Asked whenever nothing else names a Workspace, not only when both lists
+      // are empty. The Workspace stream arrives asynchronously, so on a fresh
+      // page load `workspaces.items` is usually still empty while a remembered
+      // Session keeps `sessions.ids` non-empty — and the old guard then skipped
+      // initialization entirely, leaving the page with no Workspace and no way
+      // to pick one. The Host decides eligibility; asking costs one call.
       const prepared = await this.initializeDefaultWorkspace(navigation)
       if (navigation.aborted) return
       target = prepared?.workspaceId

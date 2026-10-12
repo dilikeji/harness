@@ -4,6 +4,8 @@ import type { Context, Fiber } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent, SessionHeader, SessionId , SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
 import type { SessionRecord } from './types.ts'
+// Activates the `ctx.tenantPaths` Context merge read when filtering live sessions.
+import type {} from '@deepseek-ai/dsh-tenant'
 import { SessionQueryError } from './config.ts'
 import { readColdSessionLog, type ColdSessionLog } from './cold-read.ts'
 import { assertSessionHeadersCompatible } from './sources.ts'
@@ -67,7 +69,26 @@ export class SessionCorpus {
     for (const header of persisted) {
       records.set(header.id, { header: structuredClone(header), live: false, persisted: true })
     }
+    /*
+     * `ctx.sessions` is process-wide: it holds every live Session regardless of
+     * who started it. Persisted rows are already tenant-scoped (the store's
+     * root resolves per tenant), but the live half is not — so without this
+     * filter a second person signing in would find the first person's active
+     * conversations listed in their own sidebar.
+     *
+     * The cwd identifies the owner, because every tenant's sessions start in
+     * the one workspace derived from its username. With no ambient tenant the
+     * filter does not apply, which is the single-user process this ran as
+     * before the tenant layer existed.
+     */
+    const paths = this._ctx.get('tenantPaths')
+    const ambient = paths?.current()
     for (const session of this._ctx.sessions.list()) {
+      if (ambient !== undefined) {
+        const cwd = session.header.cwd
+        const owner = cwd === undefined || paths === undefined ? undefined : paths.tenantOfWorkspace(cwd)
+        if (owner?.username !== ambient.username) continue
+      }
       const durable = records.get(session.id)
       if (durable !== undefined) assertSessionHeadersCompatible(session.header, durable.header)
       records.set(session.id, {

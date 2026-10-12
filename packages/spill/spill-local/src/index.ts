@@ -18,6 +18,8 @@ import type { SaveTextSpill, SpillRef } from '@deepseek-ai/dsh-spill'
 import { gatherSweepRoots, sweepSpillRoots } from './cleanup.ts'
 import type { SweepRoot, WarnFn } from './cleanup.ts'
 import { privateRoot, saveTextFile } from './store.ts'
+// Activates the `ctx.tenantPaths` Context merge read for per-tenant roots.
+import type {} from '@deepseek-ai/dsh-tenant'
 
 export { discoverDefaultRoots, sweepSpillRoots } from './cleanup.ts'
 export type { SweepOptions, SweepRoot, WarnFn } from './cleanup.ts'
@@ -68,8 +70,26 @@ export class LocalSpillStore extends SpillStore {
     cleanupPeriodDays: z.number().step(1).min(0).default(30),
   })
 
-  /** Resolved absolute spill root (config `root`, else the private default), fixed at construction. */
-  readonly root: string
+  /**
+   * Configured fallback root (config `root`, else the private default), fixed
+   * at construction so a later `process.cwd()` change cannot split one backend
+   * across roots.
+   */
+  private readonly fallbackRoot: string
+
+  /**
+   * The spill root this call's tenant owns.
+   *
+   * Read per access rather than fixed at construction: `ctx.tenantPaths` is an
+   * ambient lookup, so one store serves every tenant by resolving a different
+   * directory. A spilled tool result is untrusted content read out of someone's
+   * session, so leaving it in a shared directory would be a cross-tenant read,
+   * not merely a tidiness problem. Outside a tenant chain the configured root
+   * stands, keeping the single-user layout.
+   */
+  get root(): string {
+    return this.ctx.get('tenantPaths')?.root('spill', this.fallbackRoot) ?? this.fallbackRoot
+  }
 
   /** Validated config (schemastery applied the `cleanupPeriodDays` default before construction). */
   readonly config: ResolvedConfig
@@ -85,7 +105,7 @@ export class LocalSpillStore extends SpillStore {
     // schemastery (static Config) has already filled `cleanupPeriodDays`; the
     // cast records that runtime fact for exactOptionalPropertyTypes.
     this.config = config as ResolvedConfig
-    this.root = config.root !== undefined ? resolve(config.root) : privateRoot()
+    this.fallbackRoot = config.root !== undefined ? resolve(config.root) : privateRoot()
 
     // One best-effort startup sweep, owned by the fiber. The generator body runs
     // at activation but does NOT await the sweep — it launches it and yields an

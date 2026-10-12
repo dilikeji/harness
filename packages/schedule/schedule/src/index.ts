@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto'
 import z from '@deepseek-ai/schemastery'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
+// Activates the `ctx.tenantPaths` Context merge read for per-tenant schedules.
+import type {} from '@deepseek-ai/dsh-tenant'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import { delegationDepthOf } from '@deepseek-ai/dsh-subagent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
@@ -96,6 +98,22 @@ const DEFAULT_DELIVERY_HISTORY_RECORDS = 200
  * `session/flush` listener participated, and the persistence backend providing this
  * service is the plugin that registers that listener.
  */
+/**
+ * One tenant's schedule state.
+ *
+ * Per tenant rather than per process: the stored domain holds that person's
+ * reminder rows, and the runtime is what arms and delivers them. Sharing either
+ * would let one tenant's tasks fire against another tenant's Sessions.
+ */
+interface ScheduleScope {
+  readonly domain: Promise<Domain<typeof scheduleDomain>>
+  /** Resolves when this scope's runtime is live; rejects when startup failed. */
+  initialized: Promise<void>
+  chain: Promise<unknown>
+  runtime: ScheduleRuntime | undefined
+  stopping: boolean
+}
+
 export class ScheduleService extends TypertRemoteService {
   static inject = ['agents', 'sessions', 'storageDomain', 'sessionController', 'sessionPersistence']
 
@@ -106,11 +124,7 @@ export class ScheduleService extends TypertRemoteService {
 
   /** Resolved retention bounds shared with the runtime that appends acknowledgments. */
   private readonly retention: DeliveryRetentionBounds
-  private readonly ready: Promise<Domain<typeof scheduleDomain>>
-  private readonly initialized: PromiseLike<unknown>
-  private chain: Promise<unknown> = Promise.resolve()
-  private runtime: ScheduleRuntime | undefined
-  private stopping = false
+  private readonly scopes = new Map<string, ScheduleScope>()
 
   /**
    * @param ctx - Host services owning storage, dispatch, and Session restoration.
@@ -122,47 +136,6 @@ export class ScheduleService extends TypertRemoteService {
       days: config.deliveryHistoryDays ?? DEFAULT_DELIVERY_HISTORY_DAYS,
       records: config.deliveryHistoryRecords ?? DEFAULT_DELIVERY_HISTORY_RECORDS,
     }
-    this.ready = ctx.storageDomain.open(scheduleDomain).then(async (domain) => {
-      for (const [key, task] of domain.table('tasks').entries()) {
-        if (key !== task.record.id) {
-          // The mismatch is the actionable failure; a rejecting close must not replace it.
-          try {
-            await domain.close()
-          } catch (error: unknown) {
-            ctx.logger.warn(`schedule: closing the domain after a key mismatch failed: ${String(error)}`)
-          }
-          throw new Error(`schedule: stored task key "${key}" differs from record id "${task.record.id}"`)
-        }
-      }
-      return domain
-    })
-    this.initialized = ctx.effect(async () => {
-      const domain = await this.ready
-      let cleanup: () => Promise<void>
-      try {
-        cleanup = ctx.effect(() => async () => {
-          this.stopping = true
-          await this.runtime?.dispose()
-          await this.chain // The chain contains failures after returning them to their callers.
-          await domain.close()
-        })
-      } catch (error) {
-        this.stopping = true
-        await domain.close()
-        throw error
-      }
-      const tasks = domain.table('tasks')
-      this.runtime = new ScheduleRuntime(ctx,
-        () => [...tasks.entries()].map(([, task]) => task),
-        work => this.serialize(work),
-        async (task) => {
-          await tasks.put(task.record.id, task)
-          this.emitChanged()
-        },
-        this.retention)
-      this.runtime.requestDrive()
-      return cleanup
-    })
     ctx.on('session/created', (session) => {
       // Historical Schedule events remain readable but do not populate Host tasks.
       // A throwing `session/created` listener rolls the attach back, so an unreadable
@@ -206,8 +179,138 @@ export class ScheduleService extends TypertRemoteService {
     }, 'schedule.archiveAdmission()')
   }
 
+  /**
+   * The ambient tenant's discriminator; empty outside a tenant chain.
+   */
+  private scopeKey(): string {
+    return this.ctx.get('tenantPaths')?.current()?.home ?? ''
+  }
+
+  /** The ambient tenant's schedule state; throws when it was never warmed. */
+  private scope(): ScheduleScope {
+    const key = this.scopeKey()
+    const scope = this.scopes.get(key)
+    if (scope === undefined) {
+      // Fail loud rather than fall back: a silent fallback would arm one
+      // tenant's reminders against another tenant's rows.
+      throw new Error(
+        `schedule: the schedule for ${key === '' ? 'the untented process' : `tenant '${key}'`} `
+        + 'was not warmed before use',
+      )
+    }
+    return scope
+  }
+
+  private get ready(): Promise<Domain<typeof scheduleDomain>> {
+    return this.scope().domain
+  }
+
+  private get initialized(): Promise<void> {
+    return this.scope().initialized
+  }
+
+  private get chain(): Promise<unknown> {
+    return this.scope().chain
+  }
+
+  private set chain(value: Promise<unknown>) {
+    this.scope().chain = value
+  }
+
+  private get runtime(): ScheduleRuntime | undefined {
+    return this.scope().runtime
+  }
+
+  private set runtime(value: ScheduleRuntime | undefined) {
+    this.scope().runtime = value
+  }
+
+  private get stopping(): boolean {
+    return this.scope().stopping
+  }
+
+  private set stopping(value: boolean) {
+    this.scope().stopping = value
+  }
+
+  /**
+   * Build the ambient tenant's schedule: its stored domain plus the runtime
+   * driving this tenant's tasks.
+   *
+   * Per tenant, because the rows are that person's reminders — a shared domain
+   * would arm and deliver them for whoever happened to be ambient. Called at
+   * login, like the other data-plane warmups, because handles above it are read
+   * synchronously.
+   *
+   * Idempotent; a failed start leaves nothing behind so a retry can succeed.
+   */
+  async warm(): Promise<void> {
+    const key = this.scopeKey()
+    if (this.scopes.has(key)) return
+    const scope: ScheduleScope = {
+      domain: this.openDomain(),
+      initialized: Promise.resolve(),
+      chain: Promise.resolve(),
+      runtime: undefined,
+      stopping: false,
+    }
+    this.scopes.set(key, scope)
+    try {
+      scope.initialized = this.start(scope)
+      await scope.initialized
+    } catch (error) {
+      this.scopes.delete(key)
+      throw error
+    }
+  }
+
+  /** Open this scope's domain, refusing one whose keys disagree with its records. */
+  private openDomain(): Promise<Domain<typeof scheduleDomain>> {
+    return this.ctx.storageDomain.open(scheduleDomain).then(async (domain) => {
+      for (const [taskKey, task] of domain.table('tasks').entries()) {
+        if (taskKey !== task.record.id) {
+          // The mismatch is the actionable failure; a rejecting close must not replace it.
+          try {
+            await domain.close()
+          } catch (error: unknown) {
+            this.ctx.logger.warn(`schedule: closing the domain after a key mismatch failed: ${String(error)}`)
+          }
+          throw new Error(`schedule: stored task key "${taskKey}" differs from record id "${task.record.id}"`)
+        }
+      }
+      return domain
+    })
+  }
+
+  /** Attach this scope's runtime and its teardown. */
+  private async start(scope: ScheduleScope): Promise<void> {
+    const domain = await scope.domain
+    try {
+      this.ctx.effect(() => async () => {
+        scope.stopping = true
+        await scope.runtime?.dispose()
+        await scope.chain // The chain contains failures after returning them to their callers.
+        await domain.close()
+      })
+    } catch (error) {
+      scope.stopping = true
+      await domain.close()
+      throw error
+    }
+    const tasks = domain.table('tasks')
+    scope.runtime = new ScheduleRuntime(this.ctx,
+      () => [...tasks.entries()].map(([, task]) => task),
+      work => this.serialize(work),
+      async (task) => {
+        await tasks.put(task.record.id, task)
+        this.emitChanged()
+      },
+      this.retention)
+    scope.runtime.requestDrive()
+  }
+
   async [Service.init](): Promise<void> {
-    await this.initialized
+    await this.warm()
   }
 
   /**

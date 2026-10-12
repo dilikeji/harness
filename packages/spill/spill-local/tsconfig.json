@@ -17,6 +17,9 @@
     },
     {
       "path": "../spill"
+    },
+    {
+      "path": "../../tenant/tenant"
     }
   ]
 }

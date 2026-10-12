@@ -7,6 +7,7 @@ import {
 } from '../rpc.ts'
 import type { ClientConnectionRpc, ConnectionRpcResult } from '../rpc.ts'
 import { randomUuid } from './random-uuid.ts'
+import { tenantAuthHeaders } from './tenant-token.ts'
 
 const CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/
 const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/
@@ -50,7 +51,10 @@ export function createWebConnectionRpc(doFetch?: RpcFetch, openStream?: RpcStrea
         route,
         {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          // Tenant authentication travels in a header, never a cookie: a cookie
+          // is replayed by whichever browser holds it and names no one, which is
+          // exactly what two people on one origin cannot afford.
+          headers: { 'content-type': 'application/json', ...tenantAuthHeaders() },
           body: JSON.stringify(message),
           ...signal === undefined ? {} : { signal },
         },

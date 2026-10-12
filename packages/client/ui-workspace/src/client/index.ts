@@ -51,7 +51,7 @@ import { ForkSessionMenuItem } from './session-actions/ForkSession.tsx'
 import { PinSessionMenuItem, PinSessionRowButton } from './session-actions/PinSession.tsx'
 import { RenameSessionMenuItem, SessionRenameDialog } from './session-actions/RenameSession.tsx'
 import { RowActionToast } from './session-actions/RowActionToast.tsx'
-import { WorkspacePicker } from './WorkspacePicker.tsx'
+import { HiddenWorkspacePicker } from './WorkspacePicker.tsx'
 import { en, zh, type WorkspaceKey } from './locales.ts'
 
 export type { StartSessionOptions, UiWorkspace } from './navigation.ts'
@@ -307,6 +307,19 @@ export function apply(ctx: Context): void {
       name: 'shell.overlay', id: 'workspace.row-toast', locale: NS, store: viewStore, inject: rowToastInjected,
     }, RowActionToast)
   })
+  /*
+   * The conversation hero's Workspace picker is not mounted in this deployment.
+   *
+   * A tenant owns exactly one Workspace — derived from its username and created
+   * by the login exchange — so there is never a second one to choose between.
+   * Leaving the picker up offers a choice whose only wrong answers fail: a
+   * browser still holding an id from an earlier layout produced
+   * `workspace/not-found` on every new session.
+   *
+   * The slot keeps an occupant (one that renders nothing) rather than being
+   * left empty, so the hero still lays out the way its owner expects.
+   * `WorkspacePicker` stays exported here for a deployment that wants it back.
+   */
   ctx.slots.inject('conversation.hero.workspace', () => ctx.slots.register(
     {
       name: 'conversation.hero.workspace',
@@ -314,7 +327,7 @@ export function apply(ctx: Context): void {
       inject: pickerInjected,
       locale: NS,
     },
-    WorkspacePicker,
+    HiddenWorkspacePicker,
   ))
 }
 

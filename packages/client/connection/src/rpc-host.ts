@@ -3,6 +3,7 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { PeerScope } from '@deepseek-ai/dsh-typert-protocol'
+import type { Tenant } from '@deepseek-ai/dsh-tenant'
 import {
   RpcId,
   type ClientRequest,
@@ -12,6 +13,8 @@ import { clientRequestSchema } from './rpc-schema.ts'
 import { bridge } from './http-bridge.ts'
 import { isTrustedApiRequest } from './api-request-trust.ts'
 import { API_PATH } from './api-path.ts'
+import { presentedToken } from './tenant-token.ts'
+import { TenantPeer } from './tenant-peer.ts'
 import type { BrowserAuth } from './browser-auth.ts'
 import { OperatorPeer } from './operator-peer.ts'
 import type {
@@ -34,6 +37,22 @@ import type {
 const INVALID_REQUEST_RPC_ID = RpcId('invalid-request')
 const CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/
 const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/
+
+/**
+ * `/api` paths reachable before tenant authentication.
+ *
+ * The tenant login endpoints live here by necessity: they are how a browser
+ * obtains the identity every other endpoint requires.
+ *
+ * Exact paths, deliberately, and not prefixes. A prefix such as `/api/tenant/`
+ * would also publish every future route a tenant-related plugin adds below it —
+ * including ones that read user data. Widening this list should take an
+ * explicit edit to a reviewed constant, never inheritance of a neighbourhood.
+ */
+export const DEFAULT_PUBLIC_API_PATHS: readonly string[] = [
+  '/api/tenant/session',
+  '/api/tenant/me',
+]
 
 interface ConnectionRpcInterceptor {
   readonly matches: ConnectionRpcEndpointMatcher
@@ -61,8 +80,16 @@ declare module '@deepseek-ai/cordis' {
 
 /** Host Connection service whose channel registrations belong to the caller fiber. */
 export class HostConnectionService extends Service implements HostConnectionHandle {
-  /** The operator Peer every admitted request speaks for. */
+  /**
+   * The Peer that stands for this Host itself.
+   *
+   * Admitted requests speak for a tenant Peer once the tenant layer is
+   * installed; this one answers for deployments that have no tenant layer, and
+   * for the in-process callers that never present a token.
+   */
   readonly operator: PeerScope
+  private readonly tenantPeers = new Map<string, TenantPeer>()
+  private readonly publicPaths: readonly string[]
   private readonly interceptors = new Map<string, ConnectionRpcInterceptor>()
   private readonly fetchRoutes = new Map<string, RegisteredFetchRoute>()
 
@@ -70,16 +97,24 @@ export class HostConnectionService extends Service implements HostConnectionHand
    * Provide the Host half over the active HTTP server.
    * @param ctx - owning Connection plugin context.
    * @param trustedHosts - deployment authorities accepted by the Host/Origin fence.
-   * @param browserAuth - process token and persistent browser-session owner.
+   * @param browserAuth - carrier-level token extraction and index policy.
+   * @param publicPaths - exact `/api` paths reachable before tenant authentication.
    */
   constructor(
     ctx: Context,
     private readonly trustedHosts: readonly string[],
     private readonly browserAuth: BrowserAuth,
+    publicPaths: readonly string[] = DEFAULT_PUBLIC_API_PATHS,
   ) {
     super(ctx, 'connection')
+    this.publicPaths = publicPaths
     this.operator = new OperatorPeer(ctx)
     ctx.effect(() => () => this.operator.dispose(), 'client-connection: operator Peer')
+    ctx.effect(() => () => {
+      const peers = [...this.tenantPeers.values()]
+      this.tenantPeers.clear()
+      return Promise.all(peers.map(peer => peer.dispose())).then(() => undefined)
+    }, 'client-connection: tenant Peers')
   }
 
   /** Generic channel registry scoped to the Context reading this service. */
@@ -100,24 +135,50 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
   }
 
-  /** Apply the configured Host/Origin fence, then browser authentication. */
-  requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
+  /** Apply the configured Host/Origin fence, then tenant authentication. */
+  requestRejection(
+    request: ConnectionTrustRequest,
+    upgradeUrl?: string,
+  ): ConnectionRequestRejection {
     if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
-    return this.browserAuth.isAuthenticated(request) ? undefined : 401
+    return this.peerFor(request, upgradeUrl) === undefined ? 401 : undefined
   }
 
-  /** A request that passes the fence and authentication speaks for the operator. */
-  admit(request: ConnectionTrustRequest): PeerAdmission {
-    const rejection = this.requestRejection(request)
-    return rejection === undefined ? { peer: this.operator } : { rejection }
+  /** A request that passes the fence and authentication speaks for its admitting Peer. */
+  admit(request: ConnectionTrustRequest, upgradeUrl?: string): PeerAdmission {
+    const rejection = this.requestRejection(request, upgradeUrl)
+    if (rejection !== undefined) return { rejection }
+    const peer = this.peerFor(request, upgradeUrl)
+    /* v8 ignore next -- requestRejection already proved the same resolution succeeds. */
+    return peer === undefined ? { rejection: 401 } : { peer }
   }
 
-  /** Authenticate an index request through the process-token exchange or cookie. */
+  /**
+   * Install the ambient tenant behind one Peer for the nested chain.
+   *
+   * The tenant comes from the Peer, not from a parameter: the peer is already
+   * threaded through every Remote invocation, so this is the one place that has
+   * to know both concepts, and every layer below it keeps its single-user
+   * signature.
+   */
+  runWithPeer<T>(peer: PeerScope, operation: () => T): T {
+    if (!(peer instanceof TenantPeer)) return operation()
+    const paths = this.ctx.get('tenantPaths')
+    return paths === undefined ? operation() : paths.run(peer.tenant, operation)
+  }
+
+  /** Whether one `/api` path is reachable before tenant authentication. */
+  isPublicApiPath(path: string | undefined): boolean {
+    if (path === undefined) return false
+    return this.publicPaths.includes(path.split('?', 1)[0] ?? '')
+  }
+
+  /** Serve the index; the static shell is public under tenant authentication. */
   authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean {
     return this.browserAuth.authorizeIndex(request, response)
   }
 
-  /** Add this process's launch token to the clean application URL. */
+  /** Present the application URL; the entry token now comes from the deployment. */
   authenticatedUrl(baseUrl: string): string {
     return this.browserAuth.authenticatedUrl(baseUrl)
   }
@@ -149,6 +210,44 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
   }
 
+  /**
+   * The Peer one request speaks for.
+   *
+   * Without a tenant layer this Host has exactly one party, so every admitted
+   * request is the operator. With one, the presented token must resolve to an
+   * already admitted tenant: this path is synchronous and therefore cannot call
+   * the auth endpoint, so the tenant login route is what warms the cache it
+   * reads. A token that resolves to nobody is not a rejection here — the caller
+   * turns `undefined` into 401 — because "no tenant layer" and "unknown token"
+   * have to stay distinguishable.
+   */
+  private peerFor(request: ConnectionTrustRequest, upgradeUrl?: string): PeerScope | undefined {
+    const tenants = this.ctx.get('tenants')
+    if (tenants === undefined) return this.operator
+    const token = presentedToken({
+      headers: request.headers,
+      ...upgradeUrl === undefined ? {} : { url: upgradeUrl },
+    })
+    if (token === undefined) return undefined
+    const tenant = tenants.peek(token)
+    return tenant === undefined ? undefined : this.peerForTenant(tenant)
+  }
+
+  /** One Peer and one scope per tenant, held for this service's lifetime. */
+  private peerForTenant(tenant: Tenant): TenantPeer {
+    const existing = this.tenantPeers.get(tenant.username)
+    if (existing !== undefined) return existing
+    const created = new TenantPeer(this.ctx, tenant)
+    this.tenantPeers.set(tenant.username, created)
+    return created
+  }
+
+  /** Resolve the Peer for a Fetch-shaped request already past the HTTP carrier. */
+  private peerForFetch(request: Request): PeerScope {
+    const admission = this.admit({ headers: request.headers })
+    return 'peer' in admission ? admission.peer : this.operator
+  }
+
   private registerFetchRoute(
     owner: Context,
     route: ConnectionFetchRoute,
@@ -174,7 +273,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
     handler: ConnectionRpcHandler,
   ): () => Promise<void> {
     assertChannel(channel)
-    const fetchHandler = rpcFetchHandler(channel, handler, this.operator)
+    const fetchHandler = rpcFetchHandler(channel, handler, request => this.peerForFetch(request))
     const route: WebRoute = {
       kind: 'prefix',
       path: channel,
@@ -185,7 +284,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
           res.end(admission.rejection === 401 ? 'unauthorized' : 'forbidden')
           return
         }
-        await bridge(req, res, fetchHandler)
+        await this.runWithPeer(admission.peer, () => bridge(req, res, fetchHandler))
       },
     }
     return owner.effect(
@@ -205,7 +304,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
     const interceptor: ConnectionRpcInterceptor = {
       matches,
-      fetchHandler: rpcFetchHandler(channel, handler, this.operator),
+      fetchHandler: rpcFetchHandler(channel, handler, request => this.peerForFetch(request)),
     }
     return owner.effect(() => {
       if (this.interceptors.has(channel)) {
@@ -222,7 +321,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
 function rpcFetchHandler(
   channel: string,
   handler: ConnectionRpcHandler,
-  peer: PeerScope,
+  peerOf: (request: Request) => PeerScope,
 ): ConnectionFetchHandler {
   return {
     requestBodyMode: () => 'buffered',
@@ -258,7 +357,7 @@ function rpcFetchHandler(
       }
 
       try {
-        const result = await handler(endpoint, message.payload, request.signal, peer)
+        const result = await handler(endpoint, message.payload, request.signal, peerOf(request))
         return fullResponse(message.rpcId, result)
       } catch (error) {
         return new Response(`handler failure: ${String(error)}`, { status: 500 })

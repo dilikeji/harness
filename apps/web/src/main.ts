@@ -1,6 +1,7 @@
 /** Browser entry for the Web client. */
 import '@deepseek-ai/dsh-client-ui-theme/brand-font.css'
 import { AppWebEntry, applyIndexInjections } from '@deepseek-ai/dsh-client-web'
+import { ensureTenant } from './tenant-gate.ts'
 
 interface DesktopBootGlobal {
   dshDesktopBoot?: {
@@ -14,9 +15,11 @@ const reportFailure = (reason: unknown): void => {
   void desktop.failed(reason instanceof Error ? reason.message : String(reason)).catch(console.error)
 }
 
-try {
-  const el = document.getElementById('root')
-  if (el === null) throw new Error('web app: missing #root')
+/**
+ * Start the client shell.
+ * @param el - application mount point, cleared of the gate's notice by the first mount.
+ */
+function startApplication(el: HTMLElement): void {
   const entry = new AppWebEntry(el)
   if (desktop !== undefined) {
     const gate = (globalThis as { __DSH_BOOT_READY__?: PromiseWithResolvers<void> }).__DSH_BOOT_READY__
@@ -35,6 +38,24 @@ try {
     }).catch((error: unknown) => { gate.reject(error) })
   }
   void entry.run(desktop === undefined ? undefined : reportFailure)
-} catch (reason) {
-  reportFailure(reason)
 }
+
+/**
+ * Establish identity, then start the shell.
+ *
+ * The order is the whole point: under tenant authentication every request the
+ * application makes carries this page's token, so a shell started without one
+ * renders a surface that answers 401 to everything it asks. The gate renders its
+ * own blocking notice on failure, which is why the shell is simply not started.
+ */
+async function boot(): Promise<void> {
+  try {
+    const el = document.getElementById('root')
+    if (el === null) throw new Error('web app: missing #root')
+    if (await ensureTenant(el)) startApplication(el)
+  } catch (reason) {
+    reportFailure(reason)
+  }
+}
+
+void boot()

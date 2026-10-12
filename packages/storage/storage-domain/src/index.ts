@@ -9,6 +9,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+// Activates the `ctx.tenantPaths` Context merge read by instance scoping.
+import type {} from '@deepseek-ai/dsh-tenant'
 import { storageBackendServiceKey } from '@deepseek-ai/dsh-storage'
 import { DomainError } from './error.ts'
 import { descriptorOf } from './spec.ts'
@@ -70,6 +72,14 @@ export class DomainFacility {
   private readonly domains = new Map<string, DomainImpl>()
   /** Names reserved by an in-flight or completed open, so concurrent opens of one name fail loud. */
   private readonly reserved = new Set<string>()
+  /**
+   * Every spec this facility has opened, by name.
+   *
+   * Kept because a later tenant needs the same set opened again for itself, and
+   * the only other record of "which domains exist" is the callers who asked —
+   * who by then hold handles belonging to whoever was ambient when they asked.
+   */
+  private readonly specs = new Map<string, DomainSpec>()
 
   /**
    * @param ctx - Context of the domain plugin; open-domain effects and change
@@ -80,6 +90,37 @@ export class DomainFacility {
     private readonly ctx: Context,
     private readonly config: Config,
   ) {}
+
+  /**
+   * One domain instance's key: the ambient tenant plus the domain name.
+   *
+   * Under multi-tenancy a domain name stops identifying a single instance —
+   * each tenant owns its own copy of every domain, loaded from its own
+   * directory. The tenant home is the discriminator, and it is empty outside a
+   * tenant chain, which is exactly the single-user case the facility was built
+   * around.
+   */
+  private scopeKey(name: string): string {
+    return `${this.ctx.get('tenantPaths')?.current()?.home ?? ''}\u0000${name}`
+  }
+
+  /**
+   * Open every domain this facility has opened before, for the ambient tenant.
+   *
+   * A tenant must be warmed before its requests are served, because domain
+   * handles are read **synchronously** (`KvTable.get`, `DomainGlobal.get`) and
+   * a synchronous read cannot await a first open. Warming at login is what makes
+   * `WorkspaceRegistry.list()` and its peers stay synchronous while still
+   * serving per-tenant data.
+   *
+   * Already-open domains are skipped, so calling this repeatedly is free.
+   */
+  async warmKnown(): Promise<void> {
+    for (const spec of this.specs.values()) {
+      if (this.domains.has(this.scopeKey(spec.name))) continue
+      await this.open(spec)
+    }
+  }
 
   /**
    * Open one declared domain. Steps, each failing the whole call: reject a
@@ -101,10 +142,11 @@ export class DomainFacility {
    * @returns the opened domain handle, typed by the spec.
    */
   async open<S extends DomainSpec>(spec: S): Promise<Domain<S>> {
-    if (this.reserved.has(spec.name)) {
+    const key = this.scopeKey(spec.name)
+    if (this.reserved.has(key)) {
       throw new DomainError('already-open', `domain '${spec.name}' is already open`)
     }
-    this.reserved.add(spec.name)
+    this.reserved.add(key)
     try {
       const backendName = this.config.routes?.[spec.name] ?? this.config.backend
       const backend = this.ctx.storage.backend.get(backendName)
@@ -153,10 +195,11 @@ export class DomainFacility {
         // landing during the drain still emit domain/changed, and the name
         // frees up for reopening only once the domain is fully closed.
         const domain: DomainImpl = new DomainImpl(this.ctx, spec, unit, tables, globalValue, () => {
-          this.domains.delete(spec.name)
-          this.reserved.delete(spec.name)
+          this.domains.delete(key)
+          this.reserved.delete(key)
         })
-        this.domains.set(spec.name, domain)
+        this.domains.set(key, domain)
+        this.specs.set(spec.name, spec)
         // The single type-erasure point: DomainImpl is the untyped runtime,
         // Domain<S> the spec-typed view; the unknown hop is required because
         // S's conditional global-handle type stays unresolved here.
@@ -168,19 +211,19 @@ export class DomainFacility {
     } catch (error) {
       // Any failure means the domain never registered (nothing can throw
       // after it), so releasing the name reservation is unconditional.
-      this.reserved.delete(spec.name)
+      this.reserved.delete(key)
       throw error
     }
   }
 
   /**
-   * Look up an open domain by name, untyped. Diagnostic surface; typed
-   * consumers hold the handle returned by {@link open}.
+   * Look up an open domain by name, untyped, for the ambient tenant.
+   * Diagnostic surface; typed consumers hold the handle returned by {@link open}.
    * @param name - Domain name.
    * @returns the open domain runtime, or `undefined` when not open.
    */
   get(name: string): DomainImpl | undefined {
-    return this.domains.get(name)
+    return this.domains.get(this.scopeKey(name))
   }
 
   /**

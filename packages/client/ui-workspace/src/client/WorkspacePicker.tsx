@@ -23,6 +23,20 @@ import css from './WorkspacePicker.module.css'
 
 const ADD_WORKSPACE = '::add-workspace'
 
+/**
+ * The picker's stand-in for deployments that mount no picker.
+ *
+ * A tenant owns exactly one Workspace — derived from its username and created
+ * by the login exchange — so there is never a second one to choose between.
+ * Mounting the real picker there offers a choice whose only wrong answers fail:
+ * a browser still holding an id from an earlier layout produced
+ * `workspace/not-found` on every new session.
+ *
+ * Typed as the picker it replaces, so swapping the two back is a one-word
+ * change at the registration site.
+ */
+export const HiddenWorkspacePicker: typeof WorkspacePicker = () => <></>
+
 /** Core flow props: the owner supplies popover control and pick semantics. */
 export interface WorkspacePickFlowProps {
   /** The standard locale seat, forwarded by whichever slot entry hosts the flow. */

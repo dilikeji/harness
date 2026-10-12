@@ -18,6 +18,8 @@
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+// Activates the `ctx.tenantPaths` Context merge read for per-tenant caches.
+import type {} from '@deepseek-ai/dsh-tenant'
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import { SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type {
@@ -106,18 +108,49 @@ export class SessionProjectionCache extends Service {
 
   static Config: z<Config> = Config
 
-  private table?: KvTable<SessionId, CheckpointRecord>
+  private readonly tables = new Map<string, KvTable<SessionId, CheckpointRecord>>()
   private readonly dirty = new Map<Session, DirtyState>()
 
   constructor(ctx: Context, public config: Config) {
     super(ctx, 'sessionProjectionCache')
   }
 
-  /** Open the domain and install the write-behind listeners. */
-  protected async [Service.init](): Promise<void> {
+  /** The ambient tenant's discriminator; empty outside a tenant chain. */
+  private scopeKey(): string {
+    return this.ctx.get('tenantPaths')?.current()?.home ?? ''
+  }
+
+  private get table(): KvTable<SessionId, CheckpointRecord> {
+    const table = this.tables.get(this.scopeKey())
+    if (table === undefined) {
+      throw new Error(
+        'session projection cache: this tenant\'s cache was not warmed before use',
+      )
+    }
+    return table
+  }
+
+  /**
+   * Build the ambient tenant's projection cache.
+   *
+   * Per tenant, because the records are that tenant's sessions' checkpoints and
+   * a shared table would serve one person's conversation titles to another. The
+   * handle is read synchronously, so it must exist before the first request —
+   * login warms it, exactly as it warms the workspace registry.
+   *
+   * Idempotent.
+   */
+  async warm(): Promise<void> {
+    const key = this.scopeKey()
+    if (this.tables.has(key)) return
     const domain = await this.ctx.storageDomain.open(projectionCacheDomainSpec)
     this.ctx.effect(() => () => domain.close(), 'sessionProjectionCache.domainClose')
-    this.table = domain.table('sessions')
+    this.tables.set(key, domain.table('sessions'))
+  }
+
+  /** Warm the untented cache and install the write-behind listeners. */
+  protected async [Service.init](): Promise<void> {
+    await this.warm()
     this.installWritePath()
   }
 

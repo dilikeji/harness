@@ -3,6 +3,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { Deque } from '@deepseek-ai/dsh-deque'
 import type { DomainChanged } from '@deepseek-ai/dsh-storage-domain'
+// Activates the `ctx.tenantPaths` Context merge read for per-tenant scopes.
+import type {} from '@deepseek-ai/dsh-tenant'
 import type { Workspace, WorkspaceRecord } from '@deepseek-ai/dsh-workspace'
 import {
   workspaceDomainState,
@@ -43,26 +45,66 @@ function changedWorkspaceView(workspaceId: string, value: unknown): WorkspaceVie
   }
 }
 
+/**
+ * One tenant's observation state.
+ *
+ * Everything here is per-tenant. The follower set matters most: domain changes
+ * are emitted on the writer's stack, so without a tenant on the frames every
+ * subscriber would be told about every other person's deletions. The observed
+ * sets matter too — a shared `knownIds` would make one tenant's new Workspace
+ * look "already known" and silently drop its own upsert.
+ */
+interface FeedScope {
+  readonly followers: Set<WorkspaceFollower>
+  knownIds: Set<string>
+  order: readonly string[]
+  archived: readonly string[]
+  pinned: readonly string[]
+}
+
 /** Owns Workspace domain observation and all active follow generations. */
 export class WorkspaceFeed {
-  private readonly followers = new Set<WorkspaceFollower>()
-  private knownIds: Set<string>
-  private order: readonly string[]
-  private archived: readonly string[]
-  private pinned: readonly string[]
+  private readonly scopes = new Map<string, FeedScope>()
 
   /** @param ctx - Host context containing the authoritative Workspace registry. */
   constructor(private readonly ctx: Context) {
-    const baseline = ctx.workspaceRegistry.list()
-    this.knownIds = new Set(baseline.map(workspace => String(workspace.id)))
-    this.order = baseline.map(workspace => String(workspace.id))
-    this.archived = ctx.workspaceRegistry.archivedSessionIds.map(String)
-    this.pinned = ctx.workspaceRegistry.pinnedSessionIds.map(String)
     ctx.on('domain/changed', (change: DomainChanged) => { this.changed(change) })
     ctx.effect(() => () => {
-      for (const follower of this.followers) follower.close()
-      this.followers.clear()
+      for (const scope of this.scopes.values()) {
+        for (const follower of scope.followers) follower.close()
+        scope.followers.clear()
+      }
+      this.scopes.clear()
     }, 'workspace-controller.feed')
+  }
+
+  /** The ambient tenant's discriminator; empty outside a tenant chain. */
+  private scopeKey(): string {
+    return this.ctx.get('tenantPaths')?.current()?.home ?? ''
+  }
+
+  /**
+   * The ambient tenant's observation state, built from the registry on first use.
+   *
+   * Built lazily for the same reason it is keyed: the constructor runs at
+   * startup, before any tenant exists, so a snapshot taken there can only ever
+   * describe the untenanted registry.
+   */
+  private scope(): FeedScope {
+    const key = this.scopeKey()
+    const existing = this.scopes.get(key)
+    if (existing !== undefined) return existing
+    const registry = this.ctx.workspaceRegistry
+    const baseline = registry.list()
+    const created: FeedScope = {
+      followers: new Set(),
+      knownIds: new Set(baseline.map(workspace => String(workspace.id))),
+      order: baseline.map(workspace => String(workspace.id)),
+      archived: registry.archivedSessionIds.map(String),
+      pinned: registry.pinnedSessionIds.map(String),
+    }
+    this.scopes.set(key, created)
+    return created
   }
 
   /**
@@ -84,62 +126,78 @@ export class WorkspaceFeed {
    */
   async *follow(signal: AbortSignal): AsyncIterable<WorkspaceFollowFrame> {
     signal.throwIfAborted()
+    const scope = this.scope()
+    const first = this.baseline()
+    // Console, not ctx.logger: the shipped CLI mounts no logger backend, so the
+    // Cordis logger discards every line. Opening a Workspace stream happens once
+    // per page load, and knowing which Workspace set a browser was handed — and
+    // on behalf of whom — is what makes a "no workspace to use" report
+    // answerable without guessing.
+    console.warn(
+      '[workspace] follow baseline: %d workspace(s) for %s',
+      first.items.length,
+      first.items.map(item => item.title).join(', ') || '(none)',
+    )
     const follower = new WorkspaceFollower()
-    this.followers.add(follower)
+    scope.followers.add(follower)
     try {
-      yield { type: 'baseline', value: this.baseline() }
+      yield { type: 'baseline', value: first }
       yield* follower.read(signal)
     } finally {
-      this.followers.delete(follower)
+      scope.followers.delete(follower)
       follower.close()
     }
   }
 
   private changed(change: DomainChanged): void {
     if (change.domain !== 'workspace') return
+    // The event is emitted on the writer's stack, so the ambient tenant here is
+    // the one whose state actually moved. Broadcasting to every follower would
+    // hand one person's deletions to everybody.
+    const scope = this.scope()
     if (change.table === '') {
       if (change.operation !== 'put') return
       const state = workspaceDomainState.parse(change.value)
       const nextOrder = state.workspaceIds.map(String)
-      const orderChanged = !sameStrings(this.order, nextOrder)
+      const orderChanged = !sameStrings(scope.order, nextOrder)
       for (const id of state.workspaceIds) {
-        if (this.knownIds.has(id)) continue
+        if (scope.knownIds.has(id)) continue
         const workspace = this.ctx.workspaceRegistry.get(id)
         if (workspace === undefined) {
           throw new Error(`committed Workspace registry references missing Workspace "${id}"`)
         }
-        this.knownIds.add(id)
-        this.publish({ type: 'upsert', workspace: workspaceView(workspace) })
+        scope.knownIds.add(id)
+        this.publish(scope, { type: 'upsert', workspace: workspaceView(workspace) })
       }
-      this.order = nextOrder
-      if (orderChanged) this.publish({ type: 'order', workspaceIds: [...state.workspaceIds] })
+      scope.order = nextOrder
+      if (orderChanged) this.publish(scope, { type: 'order', workspaceIds: [...state.workspaceIds] })
       const nextArchived = state.archivedSessionIds.map(String)
-      if (!sameStrings(this.archived, nextArchived)) {
-        this.archived = nextArchived
-        this.publish({ type: 'archived', archivedSessionIds: [...state.archivedSessionIds] })
+      if (!sameStrings(scope.archived, nextArchived)) {
+        scope.archived = nextArchived
+        this.publish(scope, { type: 'archived', archivedSessionIds: [...state.archivedSessionIds] })
       }
       const nextPinned = state.pinnedSessionIds.map(String)
-      if (!sameStrings(this.pinned, nextPinned)) {
-        this.pinned = nextPinned
-        this.publish({ type: 'pinned', pinnedSessionIds: [...state.pinnedSessionIds] })
+      if (!sameStrings(scope.pinned, nextPinned)) {
+        scope.pinned = nextPinned
+        this.publish(scope, { type: 'pinned', pinnedSessionIds: [...state.pinnedSessionIds] })
       }
       return
     }
     if (change.table !== 'workspaces') return
     if (change.operation === 'deleted') {
-      if (!this.knownIds.delete(change.key)) return
-      this.publish({ type: 'remove', workspaceId: WorkspaceId(change.key) })
+      if (!scope.knownIds.delete(change.key)) return
+      this.publish(scope, { type: 'remove', workspaceId: WorkspaceId(change.key) })
       return
     }
-    if (!this.knownIds.has(change.key)) return
-    this.publish({
+    if (!scope.knownIds.has(change.key)) return
+    this.publish(scope, {
       type: 'upsert',
       workspace: changedWorkspaceView(change.key, change.value),
     })
   }
 
-  private publish(frame: Exclude<WorkspaceFollowFrame, { readonly type: 'baseline' }>): void {
-    for (const follower of this.followers) follower.push(frame)
+  private publish(scope: FeedScope, frame: Exclude<WorkspaceFollowFrame, { readonly type: 'baseline' }>): void {
+    for (const follower of scope.followers) follower.push(frame)
   }
 }
 

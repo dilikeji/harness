@@ -1,311 +1,102 @@
-/** Browser-session authentication for the Host Connection carrier. */
+/**
+ * Tenant-token authentication for the Host Connection carrier.
+ *
+ * ## What changed from the upstream single-user design
+ *
+ * Upstream, `?token=` was a **process** launch token exchanged once for an
+ * `HttpOnly` signed cookie; afterwards every request was the same anonymous
+ * operator. Multi-tenant operation cannot work that way — a cookie is one
+ * browser's credential and carries no identity, so two people on the same
+ * origin would be indistinguishable, and `SameSite=Strict` plus the absence of
+ * a logout made revoking one person impossible without disturbing everyone.
+ *
+ * Now the token is the **user's** token. The page reads it from its URL on
+ * first load, keeps it in `localStorage`, and presents it on every request — as
+ * `x-dsh-token` on unary calls, as `?token=` on WebSocket upgrades.
+ *
+ * This class owns only the carrier-level questions: where a token may appear,
+ * and whether the index is servable. Whether a presented token is *valid* is
+ * the tenant registry's business, and Connection asks it directly — keeping
+ * presence ({@link isAuthenticated}) and validity apart is what lets a request
+ * be admitted against a cache warmed by the login call.
+ * @module @deepseek-ai/dsh-client-connection/src/browser-auth
+ */
 
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { credentialKey } from '@deepseek-ai/dsh-credentials'
-import type { CredentialProvider, CredentialRecord } from '@deepseek-ai/dsh-credentials'
+import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
+import { presentedToken } from './tenant-token.ts'
 import type {
   ConnectionIndexRequest,
   ConnectionIndexResponse,
   ConnectionTrustRequest,
 } from './rpc.ts'
 
-const AUTH_RECORD_KEY = credentialKey('client-connection', 'browser-session')
-const DAY_MILLISECONDS = 24 * 60 * 60 * 1000
-const SECRET_BYTES = 32
-const TOKEN_QUERY = 'token'
-const COOKIE_PREFIX = 'dsh-auth-'
-const COOKIE_PAYLOAD_VERSION = 1
-const STORED_SECRET_VERSION = 1
-const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/
-const PROCESS_LAUNCH_TOKENS = new WeakMap<object, string>()
-
-interface StoredSecretPayload {
-  readonly version: typeof STORED_SECRET_VERSION
-  readonly secret: string
-}
-
-interface BrowserCookiePayload {
-  readonly version: typeof COOKIE_PAYLOAD_VERSION
-  readonly authority: string
-  readonly issuedAt: number
-  readonly expiresAt: number
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function encodeBase64Url(value: Uint8Array): string {
-  return Buffer.from(value).toString('base64')
-    .replaceAll('+', '-')
-    .replaceAll('/', '_')
-    .replace(/=+$/u, '')
-}
-
-function decodeBase64Url(value: string): Buffer | undefined {
-  if (!BASE64URL_PATTERN.test(value) || value.length % 4 === 1) return undefined
-  const padding = '='.repeat((4 - value.length % 4) % 4)
-  const decoded = Buffer.from(value.replaceAll('-', '+').replaceAll('_', '/') + padding, 'base64')
-  return encodeBase64Url(decoded) === value ? decoded : undefined
-}
-
-function processLaunchToken(owner: object): string {
-  const existing = PROCESS_LAUNCH_TOKENS.get(owner)
-  if (existing !== undefined) return existing
-  const created = encodeBase64Url(randomBytes(SECRET_BYTES))
-  PROCESS_LAUNCH_TOKENS.set(owner, created)
-  return created
-}
-
-function header(
-  headers: ConnectionTrustRequest['headers'],
-  name: string,
-): string | undefined {
-  if (headers instanceof Headers) return headers.get(name) ?? undefined
-  const value = headers[name]
-  return typeof value === 'string' ? value : undefined
-}
-
-/** Canonical request authority used as the cookie name and signed audience. */
-function requestAuthority(headers: ConnectionTrustRequest['headers']): string | undefined {
-  const host = header(headers, 'host')
-  if (host === undefined) return undefined
-  try {
-    return new URL(`http://${host}`).host
-  } catch {
-    return undefined
-  }
-}
-
-function canonicalSecret(value: unknown): Buffer | undefined {
-  if (typeof value !== 'string') return undefined
-  const decoded = decodeBase64Url(value)
-  if (decoded === undefined || decoded.byteLength !== SECRET_BYTES) return undefined
-  return decoded
-}
-
-function storedSecret(record: CredentialRecord | undefined): Buffer | undefined {
-  if (record === undefined) return undefined
-  if (record.kind !== 'grant' || !isRecord(record.payload)
-    || record.payload.version !== STORED_SECRET_VERSION) {
-    throw new Error('client-connection: browser-session credential record has an unsupported format')
-  }
-  const secret = canonicalSecret(record.payload.secret)
-  if (secret === undefined) {
-    throw new Error('client-connection: browser-session credential record has an invalid secret')
-  }
-  return secret
-}
-
-function tokenMatches(actual: string, expected: string): boolean {
-  const actualBytes = Buffer.from(actual, 'utf8')
-  const expectedBytes = Buffer.from(expected, 'utf8')
-  return actualBytes.byteLength === expectedBytes.byteLength && timingSafeEqual(actualBytes, expectedBytes)
-}
-
-function cookieName(authority: string): string {
-  return COOKIE_PREFIX + encodeBase64Url(createHash('sha256').update(authority).digest())
-}
-
-/** Read the exact generated cookie without implementing general Cookie decoding. */
-function cookieValue(headerValue: string, name: string): string | undefined {
-  for (const segment of headerValue.split(';')) {
-    const at = segment.indexOf('=')
-    if (at === -1 || segment.slice(0, at).trim() !== name) continue
-    return segment.slice(at + 1).trim()
-  }
-  return undefined
-}
-
-/** Serialize the fixed browser-session attributes; generated names and values are cookie-safe base64url. */
-function sessionCookie(name: string, value: string, expiresAt: number, maxAgeSeconds: number): string {
-  return `${name}=${value}; Max-Age=${String(maxAgeSeconds)}; Path=/; Expires=${new Date(expiresAt).toUTCString()}; HttpOnly; SameSite=Strict`
-}
-
-function signature(secret: Buffer, body: string): Buffer {
-  return createHmac('sha256', secret).update(body).digest()
-}
-
-function encodeCookie(payload: BrowserCookiePayload, secret: Buffer): string {
-  const body = encodeBase64Url(Buffer.from(JSON.stringify(payload), 'utf8'))
-  return `v1.${body}.${encodeBase64Url(signature(secret, body))}`
-}
-
-function decodeCookie(value: string, secret: Buffer): BrowserCookiePayload | undefined {
-  const parts = value.split('.')
-  const [version, body, encodedSignature] = parts
-  if (parts.length !== 3 || version !== 'v1' || body === undefined || encodedSignature === undefined) {
-    return undefined
-  }
-  const actualSignature = decodeBase64Url(encodedSignature)
-  if (actualSignature === undefined) return undefined
-  const expectedSignature = signature(secret, body)
-  if (actualSignature.byteLength !== expectedSignature.byteLength
-    || !timingSafeEqual(actualSignature, expectedSignature)) return undefined
-  let decoded: unknown
-  try {
-    const bodyBytes = decodeBase64Url(body)
-    if (bodyBytes === undefined) return undefined
-    decoded = JSON.parse(bodyBytes.toString('utf8'))
-  } catch {
-    return undefined
-  }
-  if (!isRecord(decoded)
-    || decoded.version !== COOKIE_PAYLOAD_VERSION
-    || typeof decoded.authority !== 'string'
-    || !Number.isSafeInteger(decoded.issuedAt)
-    || !Number.isSafeInteger(decoded.expiresAt)) return undefined
-  return decoded as unknown as BrowserCookiePayload
-}
-
-async function initializeSecret(credentials: CredentialProvider): Promise<Buffer> {
-  const generated: StoredSecretPayload = {
-    version: STORED_SECRET_VERSION,
-    secret: encodeBase64Url(randomBytes(SECRET_BYTES)),
-  }
-  const record = await credentials.modifyRecord(AUTH_RECORD_KEY, (current) => {
-    if (current !== undefined) {
-      storedSecret(current)
-      return Promise.resolve(undefined)
-    }
-    return Promise.resolve({ kind: 'grant', payload: generated })
-  })
-  const secret = storedSecret(record)
-  if (secret === undefined) {
-    throw new Error('client-connection: browser-session credential record was not created')
-  }
-  return secret
-}
-
 /**
- * Process launch-token exchange and persistent signed-cookie verification.
- * Connection loads the credential provider's signing secret during activation
- * and retains it for synchronous request authentication.
+ * Carrier-level authentication for the Host Connection.
+ *
+ * The instance holds no secret: the upstream design needed a signing key to
+ * mint cookies, and with cookies gone there is nothing to sign. The class
+ * survives its own emptiness because it remains the one seam that answers
+ * "where does a token come from" for both the HTTP route and the upgrade path.
  */
 export class BrowserAuth {
-  private readonly launchToken: string
-  private readonly maxAgeMilliseconds: number
-
-  private constructor(
-    processOwner: object,
-    private readonly secret: Buffer,
-    maxAgeDays: number,
-  ) {
-    this.launchToken = processLaunchToken(processOwner)
-    this.maxAgeMilliseconds = maxAgeDays * DAY_MILLISECONDS
-    if (!Number.isSafeInteger(this.maxAgeMilliseconds)
-      || !Number.isSafeInteger(Date.now() + this.maxAgeMilliseconds)) {
-      throw new Error('client-connection: cookieMaxAgeDays exceeds the safe timestamp range')
-    }
-  }
+  private constructor() {}
 
   /**
-   * Initialize browser authentication and create its durable signing secret
-   * when this Harness home has none.
-   * @param processOwner - root application context retaining one token across Connection reloads.
-   * @param credentials - persistent credential provider for the Web profile.
-   * @param maxAgeDays - positive absolute browser-cookie lifetime in days.
-   * @returns initialized authentication owner with the process owner's launch token.
+   * Initialize carrier authentication.
+   *
+   * The parameters are retained so existing compositions and tests keep
+   * compiling; none is consulted any more. The signing secret in particular is
+   * gone — there is no cookie to sign.
+   * @param _processOwner - unused; formerly the owner of the launch token.
+   * @param _credentials - unused; formerly the storage of the signing secret.
+   * @param _maxAgeDays - unused; formerly the cookie lifetime.
+   * @returns the stateless authentication owner.
    */
-  static async create(
-    processOwner: object,
-    credentials: CredentialProvider,
-    maxAgeDays: number,
+  static create(
+    _processOwner: object,
+    _credentials: CredentialProvider,
+    _maxAgeDays: number,
   ): Promise<BrowserAuth> {
-    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays)
+    return Promise.resolve(new BrowserAuth())
   }
 
   /**
-   * Add this process's launch token to the caller's application URL.
-   * @param baseUrl - clean browser URL whose authority and mount are preserved.
-   * @returns the same URL carrying the process token as its sole authentication input.
+   * Present an application URL to a user.
+   *
+   * Upstream this appended the process launch token. The token now belongs to
+   * the deployment, which hands the browser its own entry URL, so the base URL
+   * is returned unchanged: a startup banner prints a URL people can open, and
+   * the page explains that it needs an entry token when it has none.
+   * @param baseUrl - clean application URL.
+   * @returns the same URL, unmodified.
    */
   authenticatedUrl(baseUrl: string): string {
-    const url = new URL(baseUrl)
-    url.searchParams.set(TOKEN_QUERY, this.launchToken)
-    return url.href
+    return baseUrl
   }
 
   /**
-   * Authenticate an index request. A valid root query token mints the cookie
-   * and redirects to the directory-relative clean `./`; a valid cookie lets
-   * the caller serve the index; every other request receives the same minimal
-   * 401 response.
-   * @param req - incoming root or configured-index request.
-   * @param res - response owned when this method returns false.
-   * @returns true only when the caller may serve index.html.
+   * Decide whether one request may be served the application index.
+   *
+   * Always true: the index is a static shell holding no user data, and it must
+   * be servable to a browser that has not authenticated yet — reading the token
+   * out of its own URL is precisely what the page does first.
+   * @param _req - incoming index request.
+   * @param _res - response, never owned by this method.
+   * @returns true, so the caller serves index.html.
    */
-  authorizeIndex(req: ConnectionIndexRequest, res: ConnectionIndexResponse): boolean {
-    /* v8 ignore next -- node:http always supplies url on server requests. */
-    const url = new URL(req.url ?? '/', 'http://dsh.invalid')
-    const tokens = url.searchParams.getAll(TOKEN_QUERY)
-    if (tokens.length > 0) {
-      const authority = requestAuthority(req.headers)
-      if (req.method === 'GET' && url.pathname === '/' && tokens.length === 1
-        && authority !== undefined && tokenMatches(tokens.join(''), this.launchToken)) {
-        const issuedAt = Date.now()
-        const expiresAt = issuedAt + this.maxAgeMilliseconds
-        const value = encodeCookie({
-          version: COOKIE_PAYLOAD_VERSION,
-          authority,
-          issuedAt,
-          expiresAt,
-        }, this.secret)
-        res.writeHead(303, {
-          'cache-control': 'no-store',
-          'location': './',
-          'referrer-policy': 'no-referrer',
-          'set-cookie': sessionCookie(
-            cookieName(authority), value, expiresAt, Math.floor(this.maxAgeMilliseconds / 1000),
-          ),
-        })
-        res.end()
-        return false
-      }
-      if (req.method === 'GET' && url.pathname === '/' && this.isAuthenticated(req)) {
-        res.writeHead(303, {
-          'cache-control': 'no-store',
-          'location': './',
-          'referrer-policy': 'no-referrer',
-        })
-        res.end()
-        return false
-      }
-      this.writeUnauthorized(req, res)
-      return false
-    }
-    if (this.isAuthenticated(req)) return true
-    this.writeUnauthorized(req, res)
-    return false
+  authorizeIndex(_req: ConnectionIndexRequest, _res: ConnectionIndexResponse): boolean {
+    return true
   }
 
   /**
-   * Verify the authority-bound browser cookie on a Host request.
-   * @param request - request headers carrying Host and Cookie.
-   * @returns true only for an unexpired cookie signed by this activation's loaded secret.
+   * Whether one request presents a tenant token at all.
+   *
+   * Presence only. The registry decides validity, and Connection consults it
+   * through `admit`. Do not read this as authorization.
+   * @param request - request headers, and the URL for an upgrade.
+   * @returns true when a token is present, whether or not it resolves.
    */
   isAuthenticated(request: ConnectionTrustRequest): boolean {
-    const authority = requestAuthority(request.headers)
-    const rawCookie = header(request.headers, 'cookie')
-    if (authority === undefined || rawCookie === undefined) return false
-    const value = cookieValue(rawCookie, cookieName(authority))
-    if (value === undefined) return false
-    const payload = decodeCookie(value, this.secret)
-    if (payload === undefined || payload.authority !== authority) return false
-    const now = Date.now()
-    return payload.issuedAt <= now
-      && payload.expiresAt > now
-      && payload.expiresAt > payload.issuedAt
-      && payload.expiresAt - payload.issuedAt <= this.maxAgeMilliseconds
-  }
-
-  private writeUnauthorized(req: ConnectionIndexRequest, res: ConnectionIndexResponse): void {
-    res.writeHead(401, {
-      'cache-control': 'no-store',
-      'content-type': 'text/plain; charset=utf-8',
-    })
-    res.end(req.method === 'HEAD'
-      ? undefined
-      : 'dsh web authentication required; reopen the URL printed by dsh web.\n')
+    return presentedToken({ headers: request.headers }) !== undefined
   }
 }

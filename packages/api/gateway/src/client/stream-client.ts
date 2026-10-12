@@ -469,6 +469,37 @@ export class ClientUplinkQueue implements AsyncIterable<unknown>, AsyncIterator<
   }
 }
 
+/** `localStorage` key holding the tenant token across page loads. */
+const TENANT_TOKEN_STORAGE_KEY = 'dsh.token'
+
+/** Query parameter carrying the tenant token on WebSocket upgrades. */
+const TENANT_TOKEN_QUERY = 'token'
+
+/**
+ * Read the tenant token this page stored.
+ *
+ * Inlined rather than imported from the Connection client, for two reasons.
+ * Client plugins may not value-import each other — the bundle-purity gate
+ * forbids it, because every plugin must stay a self-contained module. And a
+ * WebSocket URL is built before any Context exists, so there is no cordis
+ * service to collaborate through either.
+ *
+ * The key therefore has a second definition; both must move together:
+ * `packages/client/connection/src/client/tenant-token.ts`.
+ * @returns the stored token, or undefined when this page never authenticated.
+ */
+function readTenantToken(): string | undefined {
+  try {
+    const stored = (globalThis as { readonly localStorage?: { getItem(key: string): string | null } })
+      .localStorage?.getItem(TENANT_TOKEN_STORAGE_KEY)
+    return stored !== null && stored !== undefined && stored.length > 0 ? stored : undefined
+  } catch {
+    // Storage can be unavailable (blocked cookies, private mode, no origin);
+    // the socket then simply goes out unauthenticated, as it did before.
+    return undefined
+  }
+}
+
 function remoteStreamUrl(): string {
   // The mux route is registered absolute; a page resolves its document-relative
   // form against its own document base. A shell-owned Host on another origin
@@ -476,5 +507,10 @@ function remoteStreamUrl(): string {
   const globals = globalThis as { __DSH_TRANSPORT__?: { streamBaseUrl?: string } }
   const url = new URL(REMOTE_STREAM_MUX_PATH.slice(1), globals.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI)
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  // A browser WebSocket cannot set request headers, so this is the one request
+  // form that carries the tenant token in its query. The Host admits the query
+  // form for upgrades only, which is why no unary call may use it.
+  const token = readTenantToken()
+  if (token !== undefined) url.searchParams.set(TENANT_TOKEN_QUERY, token)
   return url.href
 }

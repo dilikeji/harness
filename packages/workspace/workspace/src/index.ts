@@ -11,6 +11,8 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type { DomainGlobal, KvTable } from '@deepseek-ai/dsh-storage-domain'
+// Activates the `ctx.tenantPaths` Context merge read for per-tenant scopes.
+import type {} from '@deepseek-ai/dsh-tenant'
 import { WorkspaceEntity } from './entity.ts'
 import type { WorkspaceEntityHost } from './entity.ts'
 
@@ -161,6 +163,24 @@ const compareHeaders = (left: SessionHeader, right: SessionHeader): number =>
   right.createdAt - left.createdAt || String(left.id).localeCompare(String(right.id))
 
 /**
+ * One tenant's registry state.
+ *
+ * Everything here is per-tenant: the domain handles address that tenant's
+ * document, and the maps are indexes derived from it. Nothing is shared, which
+ * is the point — a shared index would answer with another tenant's rows.
+ */
+interface RegistryScope {
+  table?: KvTable<WorkspaceId, WorkspaceRecord>
+  global?: DomainGlobal<WorkspaceDomainState>
+  state?: WorkspaceDomainState
+  readonly entities: Map<WorkspaceId, WorkspaceEntity>
+  readonly headers: Map<SessionId, SessionHeader>
+  readonly sessionPaths: Map<SessionId, string>
+  readonly invalidSessionPaths: Map<SessionId, string>
+  operationTail: Promise<void>
+}
+
+/**
  * Durable workspace registry. Startup waits for `sessionPersistence`, builds
  * one canonical-cwd header index, and completes the one-time history
  * bootstrap before the service becomes active. The persistence dependency is
@@ -170,14 +190,16 @@ const compareHeaders = (left: SessionHeader, right: SessionHeader): number =>
 export class WorkspaceRegistry extends Service {
   static inject = ['storageDomain', 'sessionPersistence']
 
-  private table?: KvTable<WorkspaceId, WorkspaceRecord>
-  private global?: DomainGlobal<WorkspaceDomainState>
-  private state?: WorkspaceDomainState
-  private readonly entities = new Map<WorkspaceId, WorkspaceEntity>()
-  private readonly headers = new Map<SessionId, SessionHeader>()
-  private readonly sessionPaths = new Map<SessionId, string>()
-  private readonly invalidSessionPaths = new Map<SessionId, string>()
-  private operationTail: Promise<void> = Promise.resolve()
+  /**
+   * One registry per tenant, keyed by tenant home (empty outside a tenant).
+   *
+   * Multi-tenancy changed what "the registry" means: a durable document, its
+   * loaded tables, and the indexes derived from them all belong to one person.
+   * The state is per-tenant rather than per-process, but the *logic* above it is
+   * identical for everyone — so it reads its state through the getters below and
+   * never learns that tenants exist.
+   */
+  private readonly scopes = new Map<string, RegistryScope>()
 
   private readonly host: WorkspaceEntityHost = {
     table: () => this.requireTable(),
@@ -193,13 +215,110 @@ export class WorkspaceRegistry extends Service {
     super(ctx, 'workspaceRegistry')
   }
 
+  /** The ambient tenant's discriminator; empty outside a tenant chain. */
+  private scopeKey(): string {
+    return this.ctx.get('tenantPaths')?.current()?.home ?? ''
+  }
+
+  /** The ambient tenant's state; throws when it was never warmed. */
+  private scope(): RegistryScope {
+    const key = this.scopeKey()
+    const scope = this.scopes.get(key)
+    if (scope === undefined) {
+      // Fail loud rather than fall back to the untenanted state: a silent
+      // fallback would serve one tenant another tenant's workspaces, which is
+      // the failure this whole arrangement exists to prevent.
+      throw new Error(
+        `workspace registry: the registry for ${key === '' ? 'the untented process' : `tenant '${key}'`} `
+        + 'was not warmed before use',
+      )
+    }
+    return scope
+  }
+
+  private get table(): KvTable<WorkspaceId, WorkspaceRecord> {
+    const { table } = this.scope()
+    if (table === undefined) throw new Error('workspace registry is not started yet')
+    return table
+  }
+
+  private get global(): DomainGlobal<WorkspaceDomainState> {
+    const { global } = this.scope()
+    if (global === undefined) throw new Error('workspace registry is not started yet')
+    return global
+  }
+
+  private get state(): WorkspaceDomainState {
+    const { state } = this.scope()
+    if (state === undefined) throw new Error('workspace registry is not started yet')
+    return state
+  }
+
+  private set state(value: WorkspaceDomainState) {
+    this.scope().state = value
+  }
+
+  private get entities(): Map<WorkspaceId, WorkspaceEntity> {
+    return this.scope().entities
+  }
+
+  private get headers(): Map<SessionId, SessionHeader> {
+    return this.scope().headers
+  }
+
+  private get sessionPaths(): Map<SessionId, string> {
+    return this.scope().sessionPaths
+  }
+
+  private get invalidSessionPaths(): Map<SessionId, string> {
+    return this.scope().invalidSessionPaths
+  }
+
+  private get operationTail(): Promise<void> {
+    return this.scope().operationTail
+  }
+
+  private set operationTail(value: Promise<void>) {
+    this.scope().operationTail = value
+  }
+
+  /**
+   * Build the ambient tenant's registry.
+   *
+   * Called once per tenant, at login, before any of its requests are served.
+   * That timing is not incidental: several handles above are read
+   * **synchronously** (`{@link list}`, the archived/pinned getters, `get`), and
+   * a synchronous read cannot await a first domain open. Warming is what lets
+   * the registry stay synchronous while serving per-tenant documents.
+   *
+   * Idempotent; a failed start leaves nothing behind so a retry can succeed.
+   */
+  async warm(): Promise<void> {
+    const key = this.scopeKey()
+    if (this.scopes.has(key)) return
+    const scope: RegistryScope = {
+      entities: new Map(),
+      headers: new Map(),
+      sessionPaths: new Map(),
+      invalidSessionPaths: new Map(),
+      operationTail: Promise.resolve(),
+    }
+    this.scopes.set(key, scope)
+    try {
+      await this.start(scope)
+    } catch (error) {
+      this.scopes.delete(key)
+      throw error
+    }
+  }
+
   /** Open the domain, finish bootstrap when required, and rebuild the ordered cache. */
-  protected async [Service.init](): Promise<void> {
+  private async start(scope: RegistryScope): Promise<void> {
     const domain = await this.ctx.storageDomain.open(workspaceDomainSpec)
     this.ctx.effect(() => () => domain.close(), 'workspace.domainClose')
-    this.table = domain.table('workspaces')
-    this.global = domain.global
-    this.state = domain.global.get()
+    scope.table = domain.table('workspaces')
+    scope.global = domain.global
+    scope.state = domain.global.get()
 
     await this.recoverPendingMutation()
     this.validateStoredState(this.state)
@@ -215,6 +334,11 @@ export class WorkspaceRegistry extends Service {
     this.validateStoredState(this.requireState())
     this.rebuildEntities()
     this.reportFilteredCandidates()
+  }
+
+  /** Start the untented registry; the per-tenant ones are warmed at login. */
+  protected async [Service.init](): Promise<void> {
+    await this.warm()
   }
 
   /**
@@ -257,6 +381,15 @@ export class WorkspaceRegistry extends Service {
     return this.enqueueOperation(async () => {
       const state = this.requireState()
       if (state.defaultWorkspaceId !== undefined) return this.entities.get(state.defaultWorkspaceId)
+      // A tenant owns exactly one workspace, created by its login exchange, so
+      // the answer is already known and none of the eligibility tests below
+      // apply. Returning undefined here is what put the browser into its
+      // "pick a workspace" state — with no picker mounted, that state is a dead
+      // end: the person cannot start a session at all.
+      if (this.ctx.get('tenantPaths')?.current() !== undefined) {
+        const only = state.workspaceIds[0]
+        return only === undefined ? undefined : this.entities.get(only)
+      }
       const sessions = this.ctx.get('sessions')
       if (sessions === undefined) throw new Error('default Workspace initialization requires the Session store')
       if (state.workspaceIds.length > 0 || state.archivedSessionIds.length > 0

@@ -22,7 +22,8 @@ import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-plugin-manager/types'
 import { PluginManagerPage } from './PluginManagerPage.tsx'
 import { PluginRefreshToast, type PluginRefreshToastFace } from './PluginRefreshToast.tsx'
-import { PluginsPanelIcon } from './PluginsPanelIcon.tsx'
+// Restore together with the `sidebar.panellist` registration below.
+// import { PluginsPanelIcon } from './PluginsPanelIcon.tsx'
 import { configLedgerSource } from './config-ledger.ts'
 import { PluginManagerController } from './manager-store.ts'
 import { en, zh, type PluginManagerLocaleKey } from './locales.ts'
@@ -75,7 +76,8 @@ export const inject = ['slots', 'locale', 'remote', 'remote.pluginManager', 'rem
  */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-plugin-manager: dictionaries')
-  const t = ctx.locale.bind(NS)
+  // Bound back when the `sidebar.panellist` registration below is restored.
+  // const t = ctx.locale.bind(NS)
   const controller = new PluginManagerController(ctx)
   ctx.effect(() => () => { controller.dispose() }, 'ui-plugin-manager: controller')
   // The Host says when what is installed, enabled, or composed changed — from
@@ -138,12 +140,23 @@ export function apply(ctx: ClientContext): void {
     })
     yield () => { void disposeNavigation() }
   })
-  ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
-    name: 'sidebar.panellist',
-    id: PANEL_ID,
-    order: 0,
-    label: () => t('panel'),
-    locale: NS,
-  }, PluginsPanelIcon))
+  /*
+   * The sidebar's Plugins entry is deliberately not mounted in this deployment.
+   *
+   * Plugin management is a Host- and profile-level concern — which plugins are
+   * installed, and what they are configured with — and the deployment owns the
+   * profile. A tenant has nothing to change here, so the entry only offers a
+   * way to disturb a composition they do not own.
+   *
+   * The Plugins panel itself stays registered (above), so the entry can be
+   * restored by mounting this one call again.
+   */
+  // ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+  //   name: 'sidebar.panellist',
+  //   id: PANEL_ID,
+  //   order: 0,
+  //   label: () => t('panel'),
+  //   locale: NS,
+  // }, PluginsPanelIcon))
 
 }

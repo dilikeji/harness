@@ -11,6 +11,7 @@
     "src/browser-auth.ts",
     "src/client/random-uuid.ts",
     "src/client/rpc.ts",
+    "src/client/tenant-token.ts",
     "src/http-bridge.ts",
     "src/index.ts",
     "src/loopback-hostname.ts",
@@ -18,7 +19,9 @@
     "src/recovery-config.ts",
     "src/rpc-host.ts",
     "src/rpc-schema.ts",
-    "src/rpc.ts"
+    "src/rpc.ts",
+    "src/tenant-peer.ts",
+    "src/tenant-token.ts"
   ],
   "references": [
     {
@@ -41,6 +44,9 @@
     },
     {
       "path": "../../host/webserver"
+    },
+    {
+      "path": "../../tenant/tenant"
     },
     {
       "path": "../../typert/protocol"

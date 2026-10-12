@@ -172,6 +172,19 @@ export function apply(ctx: ClientContext): void {
       },
     },
   })
+  /*
+   * The sidebar's Settings entry point is deliberately NOT mounted in this
+   * deployment, so the bottom-left corner carries no launcher and its keyboard
+   * shortcut is not registered either.
+   *
+   * The settings surface exposed Host- and profile-level configuration that a
+   * tenant has no business changing: the deployment owns the model endpoint and
+   * the key, and the workspace is derived rather than chosen. Everything a
+   * person can legitimately change here is the permission mode, which is pinned
+   * by the deployment too.
+   *
+   * Restoring the call below re-enables both the launcher and its shortcut.
+   */
   ctx.slots.inject('sidebar.settings', () => {
     const shellHandle = createSettingsShellStore()
     const shellInstance = shellHandle.create()

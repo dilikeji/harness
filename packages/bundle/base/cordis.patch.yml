@@ -117,6 +117,29 @@
     - id: credentials
       name: '@deepseek-ai/dsh-credentials-local'
 
+    # Multi-tenant identity. The token a browser presents on every request
+    # resolves to exactly one tenant, whose home, workspace, credentials
+    # document, and session history this process keeps apart from every other
+    # tenant's — one process, many people.
+    #
+    # Every row that consumes a data root asks `ctx.tenantPaths` for it, so this
+    # row installs that service before anything can need it. The service has no
+    # `inject` list precisely so it can load first: a dependency on credentials
+    # would close into a cycle, because the credentials document's path is itself
+    # tenant-scoped.
+    #
+    # `verify` is the deployment's authentication posture. Leaving it on calls
+    # `authEndpoint` for every unseen token. `DSH_TENANT_VERIFY=0` makes the
+    # token itself the username, which isolates folders but authenticates
+    # nobody — local development only, never a shared deployment.
+    - id: tenant
+      name: '@deepseek-ai/dsh-tenant'
+      config:
+        root: !!js dshHomePath('tenants')
+        verify: !!js process.env.DSH_TENANT_VERIFY !== '0'
+        authEndpoint: !!js process.env.DSH_AUTH_ENDPOINT ?? 'https://admin.longtongjiyun.com/v1/api/notify/harnessAuth'
+        cacheSeconds: !!js Number(process.env.DSH_AUTH_CACHE_SECONDS ?? 300)
+
     # The pi-ai multi-provider twin, mounted dormant: zero routes (and no extra
     # models in the picker) until a `llm-pi-ai:` settings section supplies provider
     # profiles — then those routes register live, keys resolving per request

@@ -10,7 +10,7 @@ import { API_PATH } from './api-path.ts'
 import { bridge, DEFAULT_MAX_REQUEST_BODY_BYTES } from './http-bridge.ts'
 import { assertTrustedAuthority } from './api-request-trust.ts'
 import { BrowserAuth } from './browser-auth.ts'
-import { HostConnectionService } from './rpc-host.ts'
+import { HostConnectionService, DEFAULT_PUBLIC_API_PATHS } from './rpc-host.ts'
 import { ConnectionRecoveryConfigSchema, resolveConnectionConfig, type ConnectionRecoveryConfig } from './recovery-config.ts'
 
 export type {
@@ -47,7 +47,13 @@ export {
   rpcResultSchema,
   serverResponseSchema,
 } from './rpc-schema.ts'
-export { HostConnectionService } from './rpc-host.ts'
+export { HostConnectionService, DEFAULT_PUBLIC_API_PATHS } from './rpc-host.ts'
+
+// Token extraction is shared with the Host features that answer before
+// authentication — the tenant login endpoints read the same token form the
+// carrier does, and must agree with it about where a token may appear.
+export { presentedToken, TENANT_TOKEN_HEADER, TENANT_TOKEN_QUERY } from './tenant-token.ts'
+export type { TokenBearingRequest } from './tenant-token.ts'
 
 export { API_PATH } from './api-path.ts'
 
@@ -101,10 +107,20 @@ export interface ConnectionConfig {
    * bind. An entry that is not a bare, canonical authority fails plugin load.
    */
   trustedHosts?: string[]
-  /** Absolute browser-session lifetime in days. Default: 30. */
+  /**
+   * Absolute browser-session lifetime in days. Default: 30.
+   * @deprecated No cookie is issued under tenant authentication: the token the
+   * page stores is the credential. The field remains so existing profile
+   * patches keep loading.
+   */
   cookieMaxAgeDays?: number
   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
   maxRequestBodyBytes?: number
+  /**
+   * Exact `/api` paths reachable before tenant authentication. Default: the
+   * tenant login endpoints. Everything else must present a valid token.
+   */
+  publicApiPaths?: string[]
 }
 
 export const Config: z<ConnectionConfig> = z.object({
@@ -112,6 +128,7 @@ export const Config: z<ConnectionConfig> = z.object({
   trustedHosts: z.array(String).default([]),
   cookieMaxAgeDays: z.natural().min(1).default(30),
   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
+  publicApiPaths: z.array(String).default([...DEFAULT_PUBLIC_API_PATHS]),
 })
 
 /**
@@ -127,6 +144,7 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
   const trustedHosts = config?.trustedHosts ?? []
   const cookieMaxAgeDays = config?.cookieMaxAgeDays ?? 30
   const maxRequestBodyBytes = config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
+  const publicApiPaths = config?.publicApiPaths ?? DEFAULT_PUBLIC_API_PATHS
   // Config boundary: a malformed entry fails the load loudly here rather than
   // silently authorizing its hostname prefix at request time.
   for (const entry of trustedHosts) assertTrustedAuthority(entry)
@@ -135,6 +153,7 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
     ctx,
     trustedHosts,
     await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
+    publicApiPaths,
   )
   ctx.inject(['webServer'], (webCtx) => {
     assertImageBodyCapacity(webCtx, maxRequestBodyBytes)
@@ -146,13 +165,26 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
       kind: 'prefix',
       path: API_PATH,
       handler: async (req, res) => {
+        // The tenant login endpoints are reachable before authentication —
+        // requiring a tenant of the one route that establishes one would make
+        // signing in impossible. They still pass the Host/Origin fence, which
+        // `bridge` does not perform on its own.
+        if (connection.isPublicApiPath(req.url)) {
+          await webCtx.waterfall('connection/request', req, res, () => bridge(req, res, fetchHandler, maxRequestBodyBytes))
+          return
+        }
         const admission = connection.admit(req)
         if ('rejection' in admission) {
           res.writeHead(admission.rejection)
           res.end(admission.rejection === 401 ? 'unauthorized' : 'forbidden')
           return
         }
-        await webCtx.waterfall('connection/request', req, res, () => bridge(req, res, fetchHandler, maxRequestBodyBytes))
+        // Every nested call below inherits the tenant named by this Peer, which
+        // is how the persistence and credential plugins resolve *whose* data
+        // they are touching without a tenant parameter anywhere in between.
+        await webCtx.waterfall('connection/request', req, res, () =>
+          connection.runWithPeer(admission.peer, () =>
+            bridge(req, res, fetchHandler, maxRequestBodyBytes)))
       },
     }
     webCtx.effect(() => webCtx.webServer.register(route), 'client-connection: /api route')

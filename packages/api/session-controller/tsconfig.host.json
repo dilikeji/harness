@@ -42,6 +42,7 @@
     { "path": "../../preset/agent-preset-registry" },
     { "path": "../../session/session-persistence" },
     { "path": "../../session/session-projection" },
+    { "path": "../../tenant/tenant" },
     { "path": "../../session/session-projection-cache" },
     { "path": "../../session/session-title" },
     { "path": "../../session-query/session-query" },
